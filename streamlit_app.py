@@ -59,7 +59,24 @@ def _load_inputs():
     book_df = load_optional_csv(book_file)
     return tickers_df, price_df, failed, price_health, broker_df, done_df, book_df
 
-if run_scan:
+REQUIRED_STATE_KEYS = [
+    "scan_df", "overlay", "route", "analog", "most_hated",
+    "asset_translation", "events", "drivers", "radar", "audit"
+]
+
+def _save_state(final_df, overlay, route, analog, most_hated, asset_translation, events, drivers, radar, audit):
+    st.session_state["scan_df"] = final_df
+    st.session_state["overlay"] = overlay
+    st.session_state["route"] = route
+    st.session_state["analog"] = analog
+    st.session_state["most_hated"] = most_hated
+    st.session_state["asset_translation"] = asset_translation
+    st.session_state["events"] = events
+    st.session_state["drivers"] = drivers
+    st.session_state["radar"] = radar
+    st.session_state["audit"] = audit
+
+def _build_and_save_state():
     tickers_df, price_df, failed, price_health, broker_df, done_df, book_df = _load_inputs()
 
     if price_df.empty:
@@ -77,25 +94,39 @@ if run_scan:
     radar = build_forward_radar(scan_df, overlay, route, top_n=20)
     final_df = merge_overlay_into_scan(scan_df, route, most_hated, analog, radar, events)
 
-    st.session_state["scan_df"] = final_df
-    st.session_state["overlay"] = overlay
-    st.session_state["route"] = route
-    st.session_state["analog"] = analog
-    st.session_state["most_hated"] = most_hated
-    st.session_state["asset_translation"] = asset_translation
-    st.session_state["events"] = events
-    st.session_state["drivers"] = drivers
-    st.session_state["radar"] = radar
-    st.session_state["audit"] = {
-        "price_health": price_health,
-        "failed_tickers": failed,
-        "broker_rows": 0 if broker_df.empty else len(broker_df),
-        "done_rows": 0 if done_df.empty else len(done_df),
-        "orderbook_rows": 0 if book_df.empty else len(book_df),
-    }
+    _save_state(
+        final_df, overlay, route, analog, most_hated, asset_translation, events, drivers, radar,
+        {
+            "price_health": price_health,
+            "failed_tickers": failed,
+            "broker_rows": 0 if broker_df.empty else len(broker_df),
+            "done_rows": 0 if done_df.empty else len(done_df),
+            "orderbook_rows": 0 if book_df.empty else len(book_df),
+        },
+    )
+
+if run_scan:
+    _build_and_save_state()
+
+missing_keys = [k for k in REQUIRED_STATE_KEYS if k not in st.session_state]
+if missing_keys and "scan_df" in st.session_state:
+    with st.spinner("Repairing missing session state..."):
+        try:
+            _build_and_save_state()
+            missing_keys = [k for k in REQUIRED_STATE_KEYS if k not in st.session_state]
+        except Exception:
+            st.warning("Session state from older app version was incomplete. Please click Run scan once.")
+            for k in REQUIRED_STATE_KEYS:
+                if k != "scan_df":
+                    st.session_state.pop(k, None)
 
 if "scan_df" not in st.session_state:
     st.info("Run scan first.")
+    st.stop()
+
+missing_keys = [k for k in REQUIRED_STATE_KEYS if k not in st.session_state]
+if missing_keys:
+    st.warning("Scan exists but some overlay state is missing. Click Run scan once to rebuild full context.")
     st.stop()
 
 scan_df = st.session_state["scan_df"]
