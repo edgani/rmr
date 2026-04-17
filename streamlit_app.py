@@ -7,12 +7,19 @@ import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
 
+from src.cache_utils import (
+    filter_cached_prices_for_universe,
+    merge_cached_and_new_prices,
+    persist_run_outputs,
+    read_cached_prices,
+    read_last_run,
+)
 from src.data_audit import audit_broker_summary, audit_done_detail, audit_orderbook, audit_prices, merge_audits
 from src.fetch_prices import fetch_yf_prices_batched, retry_failed_tickers
 from src.scoring import compute_ticker_features
 from src.universe import resolve_universe_source
 
-st.set_page_config(page_title="IDX Scanner V4.0", layout="wide")
+st.set_page_config(page_title="IDX Scanner V4.2 Maxed", layout="wide")
 BASE_DIR = Path(__file__).resolve().parent
 
 
@@ -31,17 +38,29 @@ def cached_load_universe(mode: str, uploaded_universe: pd.DataFrame | None):
     return resolve_universe_source(mode=mode, base_dir=BASE_DIR, uploaded_df=uploaded_universe)
 
 
-@st.cache_data(show_spinner=False, ttl=3600)
-def cached_fetch_prices(tickers: tuple[str, ...], start: str, batch_size: int):
-    result = fetch_yf_prices_batched(list(tickers), start=start, batch_size=batch_size)
+@st.cache_data(show_spinner=False, ttl=1800)
+def cached_fetch_prices(tickers: tuple[str, ...], start: str, batch_size: int, pause_s: float):
+    result = fetch_yf_prices_batched(list(tickers), start=start, batch_size=batch_size, pause_s=pause_s)
+    retry_reports = []
     if result.failed_tickers:
+        # second pass: single names
         retry_df = retry_failed_tickers(result.failed_tickers, start=start)
         if not retry_df.empty:
             merged = pd.concat([result.prices, retry_df], ignore_index=True)
             merged = merged.drop_duplicates(["ticker", "date"], keep="last")
             recovered = set(retry_df["ticker"].unique().tolist())
-            result.failed_tickers = [t for t in result.failed_tickers if t not in recovered]
+            still_failed = [t for t in result.failed_tickers if t not in recovered]
+            retry_reports.append({
+                "batch_no": "retry_single",
+                "requested": len(result.failed_tickers),
+                "loaded": len(recovered),
+                "failed": len(still_failed),
+                "failed_preview": ", ".join(still_failed[:10]),
+                "error": None,
+            })
+            result.failed_tickers = still_failed
             result.prices = merged
+    result.batch_reports.extend(retry_reports)
     return result
 
 
@@ -60,8 +79,11 @@ def render_candles(price_df: pd.DataFrame, ticker: str):
     st.plotly_chart(fig, use_container_width=True)
 
 
-st.title("IDX Scanner V4.0 — Full Stack Base")
-st.caption("Phase paling mentok yang masih deploy-safe: full-universe resolver, price-side EOD, broker truth layer, intraday burst + orderbook hooks, confidence, explainability.")
+st.title("IDX Scanner V4.2 — Full Mentok (Free EOD + Broker/Intraday Hooks)")
+st.caption("Full-universe resolver + disk cache + retry + broker/intraday hooks + sector-aware RS + explainability + ranking.")
+last_run = read_last_run(BASE_DIR)
+if last_run:
+    st.caption(f"Last persisted run UTC: {last_run}")
 
 with st.sidebar:
     st.subheader("Universe")
@@ -71,12 +93,15 @@ with st.sidebar:
         format_func=lambda x: {"full": "Full IHSG (local CSV first)", "auto": "Auto web fallback", "sample": "Sample only"}[x],
         index=0,
     )
-    uploaded_universe = st.file_uploader("Optional universe CSV", type=["csv"], key="universe")
+    uploaded_universe = st.file_uploader("Optional universe CSV / metadata CSV", type=["csv"], key="universe")
 
     st.subheader("Prices")
     history_months = st.slider("History (months)", min_value=6, max_value=36, value=12, step=3)
     batch_size = st.slider("yfinance batch size", min_value=10, max_value=120, value=80, step=10)
+    batch_pause_s = st.slider("Pause between batches (s)", min_value=0.0, max_value=2.0, value=0.0, step=0.1)
     max_tickers = st.number_input("Max tickers (0 = all)", min_value=0, max_value=2500, value=0, step=50)
+    use_cached_prices = st.checkbox("Use cached prices if available", value=True)
+    refresh_mode = st.radio("Refresh mode", options=["full_refresh", "cache_then_fill"], index=1)
 
     st.subheader("Optional real data")
     broker_upload = st.file_uploader("Broker summary CSV", type=["csv"], key="broker")
@@ -99,28 +124,56 @@ if run_scan:
         universe_df = universe_df.head(int(max_tickers)).copy()
     tickers = universe_df["ticker"].astype(str).tolist()
     start = str(date.today() - timedelta(days=int(history_months * 31)))
+
+    cached_prices = read_cached_prices(BASE_DIR) if use_cached_prices else pd.DataFrame()
+    cached_prices = filter_cached_prices_for_universe(cached_prices, tickers, min_start=start)
+    price_df = pd.DataFrame()
+    fetch_result = None
+
     with st.spinner(f"Fetching EOD prices for {len(tickers)} tickers..."):
-        fetch_result = cached_fetch_prices(tuple(tickers), start=start, batch_size=batch_size)
-    price_df = fetch_result.prices.copy()
-    scan_df = compute_ticker_features(price_df, broker_df=broker_df, done_df=done_df, orderbook_df=book_df)
+        if refresh_mode == "cache_then_fill" and not cached_prices.empty:
+            have_tickers = set(cached_prices["ticker"].astype(str).unique().tolist())
+            missing_tickers = [t for t in tickers if t not in have_tickers]
+            if missing_tickers:
+                fetch_result = cached_fetch_prices(tuple(missing_tickers), start=start, batch_size=batch_size, pause_s=batch_pause_s)
+                price_df = merge_cached_and_new_prices(cached_prices, fetch_result.prices)
+            else:
+                price_df = cached_prices.copy()
+                class Dummy:
+                    prices = price_df
+                    failed_tickers = []
+                    attempted_tickers = tickers
+                    batch_reports = [{"batch_no": "cache_only", "requested": len(tickers), "loaded": len(tickers), "failed": 0, "failed_preview": "", "error": None}]
+                fetch_result = Dummy()
+        else:
+            fetch_result = cached_fetch_prices(tuple(tickers), start=start, batch_size=batch_size, pause_s=batch_pause_s)
+            price_df = merge_cached_and_new_prices(cached_prices, fetch_result.prices) if use_cached_prices else fetch_result.prices.copy()
+
+    scan_df = compute_ticker_features(price_df, broker_df=broker_df, done_df=done_df, orderbook_df=book_df, metadata_df=universe_df)
     audit = merge_audits(
-        audit_prices(price_df, attempted_tickers=len(fetch_result.attempted_tickers), failed_tickers=fetch_result.failed_tickers),
+        audit_prices(price_df, attempted_tickers=len(fetch_result.attempted_tickers), failed_tickers=fetch_result.failed_tickers, batch_reports=fetch_result.batch_reports),
         audit_broker_summary(broker_df),
         audit_done_detail(done_df),
         audit_orderbook(book_df),
         universe_source,
         universe_warnings,
     )
+    audit["cache_mode"] = refresh_mode
+    audit["cache_prices_rows"] = int(len(cached_prices)) if use_cached_prices else 0
+    persist_info = persist_run_outputs(BASE_DIR, price_df, scan_df, audit)
+    audit["persist_info"] = persist_info
     st.session_state["price_df"] = price_df
     st.session_state["scan_df"] = scan_df
     st.session_state["audit"] = audit
+    st.session_state["universe_df"] = universe_df
 
 price_df = st.session_state.get("price_df", pd.DataFrame())
 scan_df = st.session_state.get("scan_df", pd.DataFrame())
 audit = st.session_state.get("audit", None)
+universe_df = st.session_state.get("universe_df", pd.DataFrame())
 
 if audit is not None:
-    cols = st.columns(7)
+    cols = st.columns(10)
     cols[0].metric("Tickers scanned", audit.get("ticker_count_loaded", 0))
     cols[1].metric("Attempted", audit.get("attempted_tickers", 0))
     cols[2].metric("Failed", audit.get("failed_ticker_count", 0))
@@ -128,13 +181,20 @@ if audit is not None:
     cols[4].metric("Broker rows", audit.get("broker_rows", 0))
     cols[5].metric("Done rows", audit.get("done_rows", 0))
     cols[6].metric("Orderbook rows", audit.get("orderbook_rows", 0))
-    st.caption(f"Universe source: {audit.get('universe_source', 'n/a')}")
+    cols[7].metric("Universe source", audit.get("universe_source", "n/a"))
+    cols[8].metric("Cache rows", audit.get("cache_prices_rows", 0))
+    cols[9].metric("Refresh mode", audit.get("cache_mode", "-"))
+    if audit.get("stale_warning"):
+        st.warning(audit["stale_warning"])
     for w in audit.get("universe_warnings", []) or []:
         st.warning(w)
     if audit.get("failed_ticker_count", 0) > 0:
-        st.info(f"Failed ticker preview: {audit.get('failed_tickers_preview', '')}")
+        with st.expander("Failed ticker report"):
+            st.write(audit.get("failed_tickers_preview", ""))
+            if audit.get("batch_reports"):
+                st.dataframe(pd.DataFrame(audit["batch_reports"]), use_container_width=True, hide_index=True)
 
-view = st.radio("View", ["Scanner", "Ticker Detail", "Intraday / Broker", "Data Audit"], horizontal=True)
+view = st.radio("View", ["Scanner", "Top Ranks", "Ticker Detail", "Intraday / Broker", "Data Audit"], horizontal=True)
 
 if view == "Scanner":
     st.subheader("Scanner Output")
@@ -144,17 +204,41 @@ if view == "Scanner":
         default_verdicts = [v for v in ["READY_LONG", "WATCH", "WATCH_REBOUND", "NEUTRAL", "TRIM", "AVOID", "ILLIQUID"] if v in scan_df["verdict"].unique()]
         verdict_filter = st.multiselect("Filter verdict", options=sorted(scan_df["verdict"].unique().tolist()), default=default_verdicts or sorted(scan_df["verdict"].unique().tolist()))
         show_complete = st.checkbox("Show only complete-data names", value=False)
+        sector_choices = sorted([str(s) for s in scan_df.get("sector", pd.Series(dtype=object)).dropna().unique().tolist()]) if "sector" in scan_df.columns else []
+        selected_sectors = st.multiselect("Filter sector", options=sector_choices, default=[])
         tmp = scan_df[scan_df["verdict"].isin(verdict_filter)].copy()
         if show_complete:
             tmp = tmp[tmp["data_completeness_score"] >= 70]
+        if selected_sectors and "sector" in tmp.columns:
+            tmp = tmp[tmp["sector"].astype(str).isin(selected_sectors)]
         cols = [
-            "ticker","close","verdict","score_confidence","phase","trend_quality","breakout_integrity",
-            "false_breakout_risk","dry_score_final","wet_score_final","liquidity_mn","broker_alignment_score",
-            "broker_mode","institutional_support","institutional_resistance","gulungan_up_score","gulungan_down_score",
-            "latest_event_label","why_now","why_not_yet","trigger","invalidator","dominant_risk"
+            "ticker","sector","close","verdict","score_confidence","phase","market_regime","execution_mode","liquidity_bucket",
+            "trend_quality","breakout_integrity","false_breakout_risk","dry_score_final","wet_score_final",
+            "broker_alignment_score","broker_mode","institutional_support","institutional_resistance",
+            "gulungan_up_score","gulungan_down_score","latest_event_label","relative_strength_20d","sector_relative_strength_20d",
+            "long_rank_score","risk_rank_score","why_now","why_not_yet","trigger","invalidator","dominant_risk"
         ]
+        cols = [c for c in cols if c in tmp.columns]
         st.dataframe(tmp[cols], use_container_width=True, hide_index=True)
-        st.download_button("Download scanner CSV", data=tmp.to_csv(index=False).encode("utf-8"), file_name="idx_scanner_v40.csv", mime="text/csv")
+        st.download_button("Download scanner CSV", data=tmp.to_csv(index=False).encode("utf-8"), file_name="idx_scanner_v42.csv", mime="text/csv")
+
+elif view == "Top Ranks":
+    st.subheader("Top Rankings")
+    if scan_df.empty:
+        st.info("Belum ada hasil scan.")
+    else:
+        n = st.slider("Top N", min_value=10, max_value=100, value=25, step=5)
+        c1, c2 = st.columns(2)
+        with c1:
+            st.markdown("### Top Long Candidates")
+            long_cols = [c for c in ["ticker","sector","verdict","long_rank_score","score_confidence","phase","relative_strength_20d","sector_relative_strength_20d","why_now","trigger","invalidator"] if c in scan_df.columns]
+            long_df = scan_df[scan_df["verdict"].isin(["READY_LONG","WATCH","WATCH_REBOUND","NEUTRAL"])].sort_values(["long_rank_score","score_confidence"], ascending=False).head(n)
+            st.dataframe(long_df[long_cols], use_container_width=True, hide_index=True)
+        with c2:
+            st.markdown("### Top Risk / Avoid / Trim")
+            risk_cols = [c for c in ["ticker","sector","verdict","risk_rank_score","score_confidence","phase","dominant_risk","why_not_yet","invalidator"] if c in scan_df.columns]
+            risk_df = scan_df.sort_values(["risk_rank_score","score_confidence"], ascending=False).head(n)
+            st.dataframe(risk_df[risk_cols], use_container_width=True, hide_index=True)
 
 elif view == "Ticker Detail":
     st.subheader("Ticker Detail")
@@ -163,18 +247,22 @@ elif view == "Ticker Detail":
     else:
         ticker = st.selectbox("Ticker", options=scan_df["ticker"].tolist())
         row = scan_df.loc[scan_df["ticker"] == ticker].iloc[0]
-        c1, c2, c3, c4 = st.columns(4)
+        c1, c2, c3, c4, c5, c6 = st.columns(6)
         c1.metric("Verdict", row["verdict"])
         c2.metric("Confidence", row["score_confidence"])
         c3.metric("Phase", row["phase"])
         c4.metric("Burst", row.get("latest_event_label", "-"))
+        c5.metric("Market", row.get("market_regime", "-"))
+        c6.metric("Sector", row.get("sector", "-"))
         render_candles(price_df, ticker)
         detail_cols = [
             "trend_quality","breakout_integrity","false_breakout_risk","dry_score_final","wet_score_final",
             "broker_alignment_score","broker_mode","overhang_score","support_20d","resistance_60d",
             "institutional_support","institutional_resistance","gulungan_up_score","gulungan_down_score",
             "effort_result_up","effort_result_down","absorption_after_up_score","absorption_after_down_score",
-            "bid_stack_quality","offer_stack_quality","data_completeness_score","module_agreement_score"
+            "bid_stack_quality","offer_stack_quality","data_completeness_score","module_agreement_score",
+            "market_breadth_pct","market_bias_score","relative_strength_20d","sector_relative_strength_20d",
+            "long_rank_score","risk_rank_score"
         ]
         detail_cols = [c for c in detail_cols if c in row.index]
         st.dataframe(pd.DataFrame([row[detail_cols]]), use_container_width=True, hide_index=True)
@@ -192,10 +280,11 @@ elif view == "Intraday / Broker":
         st.info("Belum ada hasil scan.")
     else:
         cols = [
-            "ticker", "broker_mode", "broker_alignment_score", "dominant_accumulator", "dominant_distributor",
+            "ticker", "sector", "broker_mode", "broker_alignment_score", "dominant_accumulator", "dominant_distributor",
             "institutional_support", "institutional_resistance", "overhang_score", "gulungan_up_score", "gulungan_down_score",
             "effort_result_up", "effort_result_down", "latest_event_label", "burst_bias", "bid_stack_quality",
-            "offer_stack_quality", "absorption_after_up_score", "absorption_after_down_score", "tension_score", "fragility_score"
+            "offer_stack_quality", "absorption_after_up_score", "absorption_after_down_score", "tension_score", "fragility_score",
+            "data_completeness_score"
         ]
         cols = [c for c in cols if c in scan_df.columns]
         st.dataframe(scan_df[cols], use_container_width=True, hide_index=True)
@@ -216,6 +305,9 @@ else:
                 "price_date_max": audit.get("price_date_max"),
                 "universe_source": audit.get("universe_source"),
                 "source_mode": audit.get("source_mode"),
+                "persisted": audit.get("persist_info", {}),
+                "cache_mode": audit.get("cache_mode"),
+                "cache_prices_rows": audit.get("cache_prices_rows"),
             })
         with right:
             st.markdown("### Optional Data Hooks")

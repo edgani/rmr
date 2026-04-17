@@ -20,45 +20,53 @@ WIKI_URLS = [
 
 def normalize_ticker_list(df: pd.DataFrame) -> pd.DataFrame:
     out = df.copy()
+    lowered_map = {str(c).lower().strip(): c for c in out.columns}
     if "ticker" not in out.columns:
-        # try first column
+        for cand in ["ticker", "code", "symbol", "stock code", "ticker code"]:
+            if cand in lowered_map:
+                out = out.rename(columns={lowered_map[cand]: "ticker"})
+                break
+    if "ticker" not in out.columns:
         out = out.rename(columns={out.columns[0]: "ticker"})
+    keep = [c for c in out.columns if str(c).lower().strip() in {"ticker", "sector", "board", "name", "listing_date"}]
+    if "ticker" not in keep:
+        keep = ["ticker"] + keep
+    out = out[keep].copy()
     out["ticker"] = (
-        out["ticker"]
-        .astype(str)
-        .str.upper()
-        .str.strip()
-        .str.replace(".JK", "", regex=False)
+        out["ticker"].astype(str).str.upper().str.strip().str.replace(".JK", "", regex=False)
     )
     out = out[out["ticker"].str.match(r"^[A-Z0-9]{2,8}$", na=False)]
-    out = out.drop_duplicates("ticker").sort_values("ticker").reset_index(drop=True)
-    return out[["ticker"]]
+    return out.drop_duplicates("ticker").sort_values("ticker").reset_index(drop=True)
 
 
 def _read_local_csv(path: Path) -> Optional[pd.DataFrame]:
     if not path.exists():
         return None
-    df = pd.read_csv(path)
-    return normalize_ticker_list(df)
+    return normalize_ticker_list(pd.read_csv(path))
+
+
+def _extract_tables(html: str) -> list[pd.DataFrame]:
+    try:
+        return pd.read_html(StringIO(html))
+    except Exception:
+        return []
 
 
 def _scrape_idx_official(timeout: int = 20) -> Optional[pd.DataFrame]:
     for url in OFFICIAL_IDX_STOCK_LIST_URLS:
         try:
             html = requests.get(url, timeout=timeout, headers={"User-Agent": "Mozilla/5.0"}).text
-            tables = pd.read_html(StringIO(html))
+            tables = _extract_tables(html)
             found = []
             for tbl in tables:
                 cols = [str(c).strip().lower() for c in tbl.columns]
-                if "code" in cols:
-                    col = tbl.columns[cols.index("code")]
-                    found.append(pd.DataFrame({"ticker": tbl[col]}))
-                elif "ticker code" in cols:
-                    col = tbl.columns[cols.index("ticker code")]
-                    found.append(pd.DataFrame({"ticker": tbl[col]}))
-                elif "ticker" in cols:
-                    col = tbl.columns[cols.index("ticker")]
-                    found.append(pd.DataFrame({"ticker": tbl[col]}))
+                candidates = ["code", "ticker code", "ticker", "symbol"]
+                hit = next((cand for cand in candidates if cand in cols), None)
+                if hit is None:
+                    continue
+                sub = tbl.copy()
+                sub = sub.rename(columns={tbl.columns[cols.index(hit)]: "ticker"})
+                found.append(normalize_ticker_list(sub))
             if found:
                 out = normalize_ticker_list(pd.concat(found, ignore_index=True))
                 if len(out) >= 300:
@@ -72,15 +80,15 @@ def _scrape_wikipedia(timeout: int = 20) -> Optional[pd.DataFrame]:
     for url in WIKI_URLS:
         try:
             html = requests.get(url, timeout=timeout, headers={"User-Agent": "Mozilla/5.0"}).text
-            tables = pd.read_html(StringIO(html))
+            tables = _extract_tables(html)
             found = []
             for tbl in tables:
                 cols = [str(c).strip().lower() for c in tbl.columns]
                 candidates = ["ticker", "code", "trading code", "stock code", "symbol"]
                 for cand in candidates:
                     if cand in cols:
-                        col = tbl.columns[cols.index(cand)]
-                        found.append(pd.DataFrame({"ticker": tbl[col]}))
+                        sub = tbl.copy().rename(columns={tbl.columns[cols.index(cand)]: "ticker"})
+                        found.append(normalize_ticker_list(sub))
                         break
             if found:
                 out = normalize_ticker_list(pd.concat(found, ignore_index=True))
@@ -96,9 +104,6 @@ def resolve_universe_source(
     base_dir: str | Path = ".",
     uploaded_df: Optional[pd.DataFrame] = None,
 ) -> Tuple[pd.DataFrame, str, list[str]]:
-    """
-    Returns (tickers_df, source_label, warnings)
-    """
     base_dir = Path(base_dir)
     warnings: list[str] = []
 
@@ -112,7 +117,6 @@ def resolve_universe_source(
         warnings.append("Using sample universe only. This is not full IHSG.")
         return sample, "sample", warnings
 
-    # Recommended stable local full CSV
     full_local = _read_local_csv(base_dir / "data" / "idx_universe_full.csv")
     if full_local is not None and not full_local.empty:
         return full_local, "local_full_csv", warnings
@@ -124,7 +128,7 @@ def resolve_universe_source(
 
         wiki_df = _scrape_wikipedia()
         if wiki_df is not None and not wiki_df.empty:
-            warnings.append("Universe loaded from Wikipedia/public web fallback. Validate coverage.")
+            warnings.append("Universe loaded from public web fallback. Validate coverage.")
             return wiki_df, "wikipedia_fallback", warnings
 
     sample = _read_local_csv(base_dir / "data" / "idx_universe_sample.csv")

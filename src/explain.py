@@ -29,6 +29,8 @@ def build_why_now(row: pd.Series) -> str:
     broker = _safe(row.get("broker_alignment_score"))
     burst = _txt(row.get("latest_event_label"))
     phase = str(row.get("phase", "NEUTRAL"))
+    regime = str(row.get("market_regime", "CHOPPY"))
+    rs20 = _safe(row.get("relative_strength_20d"), default=0.0)
 
     if tq >= 60:
         bits.append("trend cukup rapi")
@@ -42,9 +44,13 @@ def build_why_now(row: pd.Series) -> str:
         bits.append(f"burst {burst.lower()}")
     if phase not in {"NEUTRAL", "MARKDOWN"}:
         bits.append(f"fase {phase.lower()}")
+    if regime in {"RISK_ON", "UPTREND_SELECTIVE"}:
+        bits.append(f"market {regime.lower()}")
+    if rs20 >= 0.03:
+        bits.append("relative strength di atas median")
 
     if verdict in {"READY_LONG", "WATCH", "WATCH_REBOUND"}:
-        return ", ".join(bits[:4]) if bits else "setup mulai mendukung"
+        return ", ".join(bits[:5]) if bits else "setup mulai mendukung"
     if verdict in {"TRIM", "AVOID"}:
         return "struktur lemah atau tekanan distribusi masih dominan"
     return ", ".join(bits[:3]) if bits else "belum ada alasan kuat untuk agresif"
@@ -59,6 +65,7 @@ def build_why_not_yet(row: pd.Series) -> str:
     fb = _safe(row.get("false_breakout_risk"))
     wet = _safe(row.get("wet_score_final", row.get("wet_score")))
     broker = _safe(row.get("broker_alignment_score"))
+    regime = str(row.get("market_regime", "CHOPPY"))
 
     if verdict == "READY_LONG":
         return "tetap tunggu invalidation jelas dan jangan kejar terlalu telat"
@@ -72,6 +79,8 @@ def build_why_not_yet(row: pd.Series) -> str:
         reasons.append("supply masih agak basah")
     if 0 < broker < 55:
         reasons.append("broker belum cukup align")
+    if regime == "RISK_OFF":
+        reasons.append("market sedang risk-off")
     return ", ".join(reasons[:4]) if reasons else "konfirmasi tambahan masih dibutuhkan"
 
 
@@ -117,6 +126,7 @@ def build_risk_note(row: pd.Series) -> str:
     liq = _safe(row.get("liquidity_mn"))
     overhang = _safe(row.get("overhang_score"))
     burst = _txt(row.get("latest_event_label"))
+    regime = str(row.get("market_regime", "CHOPPY"))
     if wet >= 60:
         notes.append("masih basah")
     if fb >= 45:
@@ -127,4 +137,6 @@ def build_risk_note(row: pd.Series) -> str:
         notes.append("overhang distribusi")
     if burst.startswith("DOWN_"):
         notes.append("intraday bias masih bearish")
+    if regime == "RISK_OFF":
+        notes.append("market risk-off")
     return ", ".join(notes) if notes else "risiko relatif normal untuk setup saat ini"

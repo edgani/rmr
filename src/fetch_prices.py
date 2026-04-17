@@ -1,8 +1,9 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import date, timedelta
 from typing import Iterable
+import time
 
 import pandas as pd
 import yfinance as yf
@@ -13,6 +14,7 @@ class PriceFetchResult:
     prices: pd.DataFrame
     failed_tickers: list[str]
     attempted_tickers: list[str]
+    batch_reports: list[dict] = field(default_factory=list)
 
 
 def _chunked(items: list[str], n: int) -> Iterable[list[str]]:
@@ -24,7 +26,6 @@ def normalize_yf_download(raw: pd.DataFrame, batch: list[str]) -> pd.DataFrame:
     if raw is None or raw.empty:
         return pd.DataFrame(columns=["date", "ticker", "open", "high", "low", "close", "adj_close", "volume"])
 
-    # Single ticker shape
     if not isinstance(raw.columns, pd.MultiIndex):
         tmp = raw.reset_index().rename(columns=str.lower)
         tmp["ticker"] = batch[0].replace(".JK", "")
@@ -47,8 +48,7 @@ def normalize_yf_download(raw: pd.DataFrame, batch: list[str]) -> pd.DataFrame:
         frames.append(sub[["date", "ticker", "open", "high", "low", "close", "adj_close", "volume"]])
     if not frames:
         return pd.DataFrame(columns=["date", "ticker", "open", "high", "low", "close", "adj_close", "volume"])
-    out = pd.concat(frames, ignore_index=True)
-    return out
+    return pd.concat(frames, ignore_index=True)
 
 
 def fetch_yf_prices_batched(
@@ -64,9 +64,12 @@ def fetch_yf_prices_batched(
     attempted = list(dict.fromkeys([t.upper().replace(".JK", "") for t in tickers]))
     all_frames = []
     failed: list[str] = []
+    batch_reports: list[dict] = []
 
-    for batch in _chunked(attempted, max(1, batch_size)):
+    for idx, batch in enumerate(_chunked(attempted, max(1, batch_size)), start=1):
         symbols = [f"{t}.JK" for t in batch]
+        err = None
+        got = set()
         try:
             raw = yf.download(
                 tickers=symbols,
@@ -81,8 +84,19 @@ def fetch_yf_prices_batched(
             all_frames.append(norm)
             got = set(norm["ticker"].dropna().unique().tolist())
             failed.extend([t for t in batch if t not in got])
-        except Exception:
+        except Exception as e:
+            err = str(e)
             failed.extend(batch)
+        batch_reports.append({
+            "batch_no": idx,
+            "requested": len(batch),
+            "loaded": len(got),
+            "failed": len([t for t in batch if t not in got]),
+            "failed_preview": ", ".join([t for t in batch if t not in got][:10]),
+            "error": err,
+        })
+        if pause_s > 0:
+            time.sleep(pause_s)
 
     prices = pd.concat(all_frames, ignore_index=True) if all_frames else pd.DataFrame(
         columns=["date", "ticker", "open", "high", "low", "close", "adj_close", "volume"]
@@ -93,7 +107,7 @@ def fetch_yf_prices_batched(
             prices[c] = pd.to_numeric(prices[c], errors="coerce")
         prices = prices.dropna(subset=["date", "ticker", "close"]).sort_values(["ticker", "date"]).reset_index(drop=True)
     failed = sorted(list(dict.fromkeys(failed)))
-    return PriceFetchResult(prices=prices, failed_tickers=failed, attempted_tickers=attempted)
+    return PriceFetchResult(prices=prices, failed_tickers=failed, attempted_tickers=attempted, batch_reports=batch_reports)
 
 
 def retry_failed_tickers(
