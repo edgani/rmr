@@ -1,37 +1,34 @@
-# IDX Universe Builder Pack
+# IDX Universe All-Ticker Builder
 
-This pack helps you create a **local master universe** for the scanner so the app does not depend on unstable web fallbacks.
+Tujuan pack ini: bantu bikin `data/idx_universe_full.csv` yang jauh lebih lengkap daripada seed 300-an/374.
 
-## Build a full baseline universe from Wikipedia
+Builder akan coba:
+1. halaman resmi IDX `Daftar Saham` / `Stock List` / `Profil Perusahaan Tercatat`
+2. fallback publik dari Wikipedia / mirror publik
 
+## Run
 ```bash
 pip install pandas requests lxml html5lib
-python scripts/build_idx_universe_from_wiki.py --output data/idx_universe_full.csv
+python scripts/build_idx_universe_all.py --output data/idx_universe_full.csv
 ```
 
-This will build a local CSV with columns:
-- `ticker`
-- `symbol_yf`
-- `company_name`
-- `listing_date`
-- `shares_outstanding`
-- `board`
-- `sector`
-- `status`
-
-## Merge with your own additions / corrections
-
+## Merge file tambahan sendiri
 ```bash
-python scripts/merge_universe_csvs.py data/idx_universe_full.csv my_extra_tickers.csv --output data/idx_universe_full.csv
+python scripts/merge_universe_csvs.py data/idx_universe_full.csv my_extra.csv --output data/idx_universe_full.csv
 ```
 
-## Recommended workflow
+## Output columns
+- ticker
+- symbol_yf
+- company_name
+- listing_date
+- shares_outstanding
+- board
+- sector
+- status
+- source_url
 
-1. Build the baseline universe.
-2. Open the scanner app.
-3. Make the app read `data/idx_universe_full.csv` as the source of truth.
-4. Periodically rebuild / merge updates.
-
-## Note
-
-This is a practical way to get a much more complete universe than the small fallback sample. It is still best to replace this with a direct official export when you have one.
+## Catatan
+- builder ini ditujukan buat jalan di environment yang punya internet.
+- hasilnya tetap harus diaudit, karena sumber publik bisa berubah format.
+- kalau lu punya export resmi IDX stock list, merge saja ke file hasil builder ini dan jadikan itu source of truth app.
