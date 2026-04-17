@@ -1,0 +1,1 @@
+Master seed universe for IDX scanner. Built from prior 364-ticker starter plus manually added newer ticker candidates found on IDX company profile search results. Use as local source of truth for data/idx_universe_full.csv. Review/complete sector and board fields before production use.
