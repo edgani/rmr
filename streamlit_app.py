@@ -3,12 +3,14 @@ from __future__ import annotations
 import io
 from dataclasses import dataclass
 from typing import Optional
+import re
 
 import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
 import yfinance as yf
+import requests
 
 st.set_page_config(page_title="IDX EOD Scanner V3", layout="wide")
 
@@ -50,21 +52,91 @@ class BurstContext:
 # =============================
 
 
+def _clean_symbol_list(values) -> list[str]:
+    out = []
+    for v in values:
+        s = str(v).upper().strip().replace(".JK", "")
+        if s and s != "NAN" and re.fullmatch(r"[A-Z0-9]{4,5}", s):
+            out.append(s)
+    return sorted(set(out))
+
+
 def safe_read_universe(default_path: str = "data/idx_universe_sample.csv") -> list[str]:
+    fallback = ["BBCA", "BBRI", "BMRI", "BBNI", "TLKM", "ASII", "ANTM", "PANI"]
     try:
         df = pd.read_csv(default_path)
-        tickers = (
-            df.iloc[:, 0].astype(str).str.upper().str.replace(".JK", "", regex=False).dropna().unique().tolist()
-        )
-        out = [t for t in tickers if t and t != "NAN"]
-        return out or ["BBCA", "BBRI", "BMRI", "BBNI", "TLKM", "ASII", "ANTM", "PANI"]
+        tickers = _clean_symbol_list(df.iloc[:, 0].tolist())
+        return tickers or fallback
     except Exception:
-        return ["BBCA", "BBRI", "BMRI", "BBNI", "TLKM", "ASII", "ANTM", "PANI"]
+        return fallback
 
 
-@st.cache_data(show_spinner=False, ttl=60 * 30)
-def fetch_prices(tickers: tuple[str, ...], period: str = "18mo", interval: str = "1d") -> pd.DataFrame:
-    symbols = [f"{t}.JK" for t in tickers]
+def _extract_symbols_from_table(df: pd.DataFrame) -> list[str]:
+    colmap = {str(c).strip().lower(): c for c in df.columns}
+    for key in ["ticker", "symbol", "kode saham", "code", "stock code"]:
+        if key in colmap:
+            vals = _clean_symbol_list(df[colmap[key]].tolist())
+            if len(vals) >= 50:
+                return vals
+    best: list[str] = []
+    for c in df.columns:
+        vals = _clean_symbol_list(df[c].tolist())
+        if len(vals) > len(best):
+            best = vals
+    return best
+
+
+@st.cache_data(show_spinner=False, ttl=60 * 60 * 12)
+def fetch_full_ihsg_universe() -> tuple[list[str], str]:
+    for local_path in ["data/idx_universe_full.csv", "data/idx_universe_sample.csv"]:
+        try:
+            df = pd.read_csv(local_path)
+            vals = _clean_symbol_list(df.iloc[:, 0].tolist())
+            if local_path.endswith("full.csv") and len(vals) >= 400:
+                return vals, f"local:{local_path}"
+            if local_path.endswith("sample.csv") and len(vals) >= 50:
+                sample_vals = vals
+        except Exception:
+            pass
+
+    headers = {"User-Agent": "Mozilla/5.0"}
+    official_urls = [
+        "https://www.idx.co.id/id/data-pasar/data-saham/daftar-saham/",
+        "https://www.idx.co.id/en/market-data/stocks-data/stock-list",
+    ]
+    for url in official_urls:
+        try:
+            resp = requests.get(url, headers=headers, timeout=20)
+            if resp.ok and resp.text:
+                html = resp.text
+                regex_vals = _clean_symbol_list(re.findall(r">\s*([A-Z]{4,5})\s*<", html))
+                if len(regex_vals) >= 400:
+                    return regex_vals, f"official_idx_regex:{url}"
+                for tbl in pd.read_html(io.StringIO(html)):
+                    vals = _extract_symbols_from_table(tbl)
+                    if len(vals) >= 400:
+                        return vals, f"official_idx_table:{url}"
+        except Exception:
+            pass
+
+    wiki_url = "https://en.wikipedia.org/wiki/IDX_Composite"
+    try:
+        tables = pd.read_html(wiki_url)
+        best: list[str] = []
+        for tbl in tables:
+            vals = _extract_symbols_from_table(tbl)
+            if len(vals) > len(best):
+                best = vals
+        if len(best) >= 400:
+            return best, f"wikipedia:{wiki_url}"
+    except Exception:
+        pass
+
+    vals = safe_read_universe()
+    return vals, "fallback_sample"
+
+
+def _download_chunk(symbols: list[str], period: str, interval: str) -> pd.DataFrame:
     raw = yf.download(
         tickers=symbols,
         period=period,
@@ -74,13 +146,14 @@ def fetch_prices(tickers: tuple[str, ...], period: str = "18mo", interval: str =
         progress=False,
         threads=True,
     )
-    if raw.empty:
+    if raw is None or raw.empty:
         return pd.DataFrame()
 
     frames: list[pd.DataFrame] = []
     if isinstance(raw.columns, pd.MultiIndex):
+        available = set(raw.columns.get_level_values(0))
         for sym in symbols:
-            if sym not in raw.columns.get_level_values(0):
+            if sym not in available:
                 continue
             df = raw[sym].copy().reset_index()
             if df.empty:
@@ -92,6 +165,8 @@ def fetch_prices(tickers: tuple[str, ...], period: str = "18mo", interval: str =
         df["ticker"] = symbols[0].replace(".JK", "")
         frames.append(df)
 
+    if not frames:
+        return pd.DataFrame()
     out = pd.concat(frames, ignore_index=True)
     out.columns = [str(c).lower().replace(" ", "_") for c in out.columns]
     out["date"] = pd.to_datetime(out["date"]).dt.tz_localize(None)
@@ -99,6 +174,26 @@ def fetch_prices(tickers: tuple[str, ...], period: str = "18mo", interval: str =
         out[c] = pd.to_numeric(out[c], errors="coerce")
     out = out.dropna(subset=["open", "high", "low", "close"]).sort_values(["ticker", "date"])
     return out[["date", "ticker", "open", "high", "low", "close", "volume"]].copy()
+
+
+@st.cache_data(show_spinner=False, ttl=60 * 30)
+def fetch_prices(tickers: tuple[str, ...], period: str = "18mo", interval: str = "1d", chunk_size: int = 80) -> pd.DataFrame:
+    if not tickers:
+        return pd.DataFrame()
+    symbols = [f"{t}.JK" for t in tickers]
+    frames: list[pd.DataFrame] = []
+    for i in range(0, len(symbols), max(int(chunk_size), 1)):
+        chunk = symbols[i:i + max(int(chunk_size), 1)]
+        try:
+            part = _download_chunk(chunk, period=period, interval=interval)
+            if not part.empty:
+                frames.append(part)
+        except Exception:
+            continue
+    if not frames:
+        return pd.DataFrame()
+    out = pd.concat(frames, ignore_index=True).drop_duplicates(subset=["ticker", "date"], keep="last")
+    return out.sort_values(["ticker", "date"]).reset_index(drop=True)
 
 
 @st.cache_data(show_spinner=False)
@@ -670,16 +765,21 @@ def setup_text(row: pd.Series) -> str:
 # Streamlit UI
 # =============================
 
-st.title("IDX EOD Scanner V3")
-st.caption("Single-file IDX scanner: yfinance `.JK` untuk EOD real, optional broker summary + done detail + orderbook import untuk burst/gulungan up-down dan trap vs continuation.")
+st.title("IDX EOD Scanner V3.2 — Full IHSG Ready")
+st.caption("Single-file IDX scanner: yfinance `.JK` untuk EOD real, optional broker summary + done detail + orderbook import untuk burst/gulungan up-down dan trap vs continuation. Sekarang support full universe IHSG via free auto-fetch + batching.")
 
 with st.sidebar:
     st.header("Settings")
-    universe_choice = st.radio("Universe", ["Sample IDX universe", "Manual input"], index=0)
+    universe_choice = st.radio("Universe", ["Full IHSG (free auto-fetch)", "Sample IDX universe", "Manual input"], index=0)
     sample_tickers = safe_read_universe()
+    full_tickers, full_universe_source = fetch_full_ihsg_universe()
     default_manual = ", ".join(sample_tickers[:12])
     manual_text = st.text_area("Manual tickers (comma separated)", value=default_manual, height=150, disabled=universe_choice != "Manual input")
-    period = st.selectbox("History", ["6mo", "12mo", "18mo", "24mo"], index=2)
+    if universe_choice == "Full IHSG (free auto-fetch)":
+        st.caption(f"Universe source: {full_universe_source} | symbols: {len(full_tickers)}")
+    period = st.selectbox("History", ["6mo", "12mo", "18mo", "24mo"], index=1)
+    fetch_chunk = st.slider("yfinance batch size", 20, 120, 80, 10)
+    max_tickers = st.number_input("Max tickers (0 = all)", min_value=0, max_value=2000, value=0, step=50)
     min_liq = st.slider("Min average liquidity (IDR bn, proxy)", 0, 50, 5)
     only_best = st.checkbox("Only READY_LONG / WATCH / WATCH_REBOUND", value=False)
     st.markdown("---")
@@ -697,12 +797,22 @@ if "scan_df" not in st.session_state:
     st.session_state.burst_df = None
 
 if run:
-    tickers = sample_tickers if universe_choice == "Sample IDX universe" else [t.strip().upper().replace(".JK", "") for t in manual_text.split(",") if t.strip()]
+    if universe_choice == "Full IHSG (free auto-fetch)":
+        tickers = full_tickers
+    elif universe_choice == "Sample IDX universe":
+        tickers = sample_tickers
+    else:
+        tickers = [t.strip().upper().replace(".JK", "") for t in manual_text.split(",") if t.strip()]
+
+    tickers = _clean_symbol_list(tickers)
+    if max_tickers and max_tickers > 0:
+        tickers = tickers[: int(max_tickers)]
+
     if not tickers:
         st.error("Ticker list kosong.")
     else:
-        with st.spinner("Fetching EOD data..."):
-            price_df = fetch_prices(tuple(tickers), period=period)
+        with st.spinner(f"Fetching EOD data for {len(tickers)} tickers..."):
+            price_df = fetch_prices(tuple(tickers), period=period, chunk_size=int(fetch_chunk))
         if price_df.empty:
             st.error("Gagal ambil data harga. Coba lagi atau kurangi jumlah ticker.")
         else:
@@ -758,6 +868,9 @@ c2.metric("READY_LONG", int((scan_df["verdict"] == "READY_LONG").sum()))
 c3.metric("WATCH", int((scan_df["verdict"] == "WATCH").sum()))
 c4.metric("WATCH_REBOUND", int((scan_df["verdict"] == "WATCH_REBOUND").sum()))
 c5.metric("Intraday burst", "ON" if burst_df is not None and not burst_df.empty else "OFF")
+
+if "full_universe_source" in locals() and universe_choice == "Full IHSG (free auto-fetch)":
+    st.caption(f"Universe source used: {full_universe_source}. yfinance full-universe fetch is batched; some symbols can still fail or come back partial on a given run.")
 
 view = st.radio("View", ["Scanner", "Ticker Detail", "Intraday Burst", "Data Audit"], horizontal=True)
 
@@ -853,6 +966,9 @@ else:
         "orderbook_rows": int(len(orderbook_df)) if orderbook_df is not None else 0,
     }
     st.json(audit)
+    if universe_choice == "Full IHSG (free auto-fetch)":
+        st.write("**Universe source:**", full_universe_source)
+        st.write("**Universe symbol count:**", len(full_tickers))
     if price_df is not None and not price_df.empty:
         st.write("**Tickers loaded:**", ", ".join(sorted(price_df["ticker"].unique())[:50]))
     if broker_df is not None and not broker_df.empty:

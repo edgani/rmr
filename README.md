@@ -1,7 +1,8 @@
-# IDX EOD Scanner V3
+# IDX EOD Scanner V3.2 — Full IHSG Ready
 
 Single-file Streamlit app untuk:
 - EOD IDX via `yfinance` ticker `.JK`
+- Full universe IHSG / IDX Composite via free auto-fetch + batching
 - Optional broker summary CSV import
 - Optional done detail CSV import
 - Optional orderbook CSV import
@@ -14,15 +15,18 @@ pip install -r requirements.txt
 streamlit run streamlit_app.py
 ```
 
-## CSV templates
+## Universe modes
 
-Lihat folder `data/`:
-- `idx_universe_sample.csv`
-- `broker_summary_template.csv`
-- `done_detail_template.csv`
-- `orderbook_template.csv`
+- **Full IHSG (free auto-fetch)**
+  - coba local `data/idx_universe_full.csv`
+  - lalu official IDX stock list pages
+  - lalu fallback ke Wikipedia `IDX_Composite`
+- **Sample IDX universe**
+- **Manual input**
 
-## Minimal schema
+Untuk full universe, app download data secara **batch** supaya lebih tahan terhadap limit / partial failure di `yfinance`.
+
+## Optional CSV schema
 
 ### broker summary
 - `date`
@@ -49,5 +53,6 @@ Lihat folder `data/`:
 ## Catatan jujur
 
 - EOD tetap bergantung pada `yfinance`.
+- Full universe gratis itu **praktis**, tapi tidak akan sebersih data berlisensi / official feed.
 - Broker / done detail / orderbook layer masih bergantung pada file yang lu upload.
 - Ini belum full production Hengky-style engine, tapi sudah naik dari EOD price-side ke broker + intraday burst layer.
