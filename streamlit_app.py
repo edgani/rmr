@@ -19,6 +19,7 @@ from src.fetch_prices import fetch_yf_prices_batched, retry_failed_tickers
 from src.scoring import compute_ticker_features
 from src.universe import resolve_universe_source
 from src.route_overlay import derive_route_state, build_route_overlay
+from src.normalizers import normalize_uploaded_csv
 
 st.set_page_config(page_title="IDX Scanner V4.2 Maxed", layout="wide")
 BASE_DIR = Path(__file__).resolve().parent
@@ -28,10 +29,15 @@ def load_csv(upload, kind: str) -> pd.DataFrame:
     if upload is None:
         return pd.DataFrame()
     try:
-        return pd.read_csv(upload)
+        raw = pd.read_csv(upload)
     except Exception as e:
         st.error(f"Gagal baca {kind} CSV: {e}")
         return pd.DataFrame()
+    try:
+        return normalize_uploaded_csv(raw, kind)
+    except Exception as e:
+        st.warning(f"Normalisasi {kind} gagal, pakai raw CSV. Detail: {e}")
+        return raw
 
 
 @st.cache_data(show_spinner=False, ttl=3600)
@@ -80,7 +86,7 @@ def render_candles(price_df: pd.DataFrame, ticker: str):
     st.plotly_chart(fig, use_container_width=True)
 
 
-st.title("IDX Scanner V4.7 — Full Merge Final")
+st.title("IDX Scanner V4.7 — Full Merge Final + Input Normalizer")
 st.caption("Full-universe resolver + disk cache + retry + broker/intraday hardening + route-aware next-play overlay + explainability + ranking.")
 last_run = read_last_run(BASE_DIR)
 if last_run:

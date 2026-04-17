@@ -22,3 +22,7 @@ streamlit run streamlit_app.py
 - cached full universe fallback at `data/cache/latest_universe.csv`
 - optional `Route / catalyst events CSV` upload for next-play overlay
 - hard warning when the app falls back to the 19-name sample universe
+
+
+## Input normalizer hardening
+This build adds aggressive CSV normalization for universe/metadata, broker summary, broker master, done detail, orderbook, and route/catalyst events. Common alias columns, mixed casing, noisy currency text, and decimal comma formats are normalized automatically before scoring.
