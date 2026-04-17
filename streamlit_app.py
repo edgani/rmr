@@ -22,7 +22,6 @@ from src.universe import resolve_universe_source
 from src.route_overlay import derive_route_state, build_route_overlay
 from src.normalizers import normalize_uploaded_csv
 from src.validation import build_price_side_validation_panel, run_walk_forward_validation
-from src.macro_filter import annotate_macro_filter, apply_macro_bucket_override
 
 st.set_page_config(page_title="IDX Scanner V5.0", layout="wide")
 BASE_DIR = Path(__file__).resolve().parent
@@ -210,23 +209,14 @@ def timing_text(bucket: str) -> str:
     }.get(bucket, "-")
 
 
-def build_simple_table(scan_df: pd.DataFrame, audit: dict | None, macro_hard_filter: bool = True, macro_strictness: str = "balanced") -> pd.DataFrame:
+def build_simple_table(scan_df: pd.DataFrame, audit: dict | None) -> pd.DataFrame:
     if scan_df.empty:
         return scan_df
     micro_available = bool((audit or {}).get("done_rows", 0) > 0 or (audit or {}).get("orderbook_rows", 0) > 0)
     out = scan_df.copy()
-    if macro_hard_filter:
-        out = annotate_macro_filter(out, strictness=macro_strictness)
     statuses = out.apply(lambda r: classify_bucket(r, micro_available), axis=1)
-    base_bucket = [s[0] for s in statuses]
-    base_reason = [s[1] for s in statuses]
-    if macro_hard_filter:
-        adjusted = [apply_macro_bucket_override(r, b, strictness=macro_strictness) for (_, r), b in zip(out.iterrows(), base_bucket)]
-        out["status_awam"] = [x[0] for x in adjusted]
-        out["alasan_singkat"] = [f"{reason} | {extra}" if extra else reason for reason, (_, extra) in zip(base_reason, adjusted)]
-    else:
-        out["status_awam"] = base_bucket
-        out["alasan_singkat"] = base_reason
+    out["status_awam"] = [s[0] for s in statuses]
+    out["alasan_singkat"] = [s[1] for s in statuses]
     out["timing"] = out["status_awam"].map(timing_text)
     out["bid_offer_state"] = out.apply(lambda r: micro_label(r, micro_available), axis=1)
     out["confidence_text"] = out.get("score_confidence", 0).apply(lambda x: confidence_label(num(x)))
@@ -239,8 +229,6 @@ def build_simple_table(scan_df: pd.DataFrame, audit: dict | None, macro_hard_fil
         + pd.to_numeric(out.get("score_confidence", 0), errors="coerce").fillna(0.0) * 0.20
         - pd.to_numeric(out.get("risk_rank_score", 0), errors="coerce").fillna(0.0) * 0.15
     ).round(2)
-    if macro_hard_filter and "entry_score_macro" in out.columns:
-        out["entry_score"] = pd.to_numeric(out["entry_score_macro"], errors="coerce").fillna(out["entry_score"])
     order = {name: i for i, name in enumerate(BUCKET_ORDER)}
     out["bucket_order"] = out["status_awam"].map(order).fillna(999)
     out = out.sort_values(["bucket_order", "entry_score", "score_confidence"], ascending=[True, False, False]).reset_index(drop=True)
@@ -270,10 +258,6 @@ with st.sidebar:
     max_tickers = st.number_input("Max tickers (0 = all)", min_value=0, max_value=2500, value=0, step=50)
     use_cached_prices = st.checkbox("Use cached prices if available", value=True)
     refresh_mode = st.radio("Refresh mode", options=["full_refresh", "cache_then_fill"], index=1)
-
-    st.subheader("Macro Hard Filter")
-    macro_hard_filter = st.checkbox("Aktifkan hard filter macro/route", value=True)
-    macro_strictness = st.radio("Strictness", options=["loose", "balanced", "strict"], index=1, horizontal=True)
 
     st.subheader("Optional real data")
     broker_upload = st.file_uploader("Broker summary CSV", type=["csv"], key="broker")
@@ -367,17 +351,13 @@ if run_scan:
     st.session_state["scan_df"] = scan_df
     st.session_state["audit"] = audit
     st.session_state["universe_df"] = universe_df
-    st.session_state["simple_df"] = build_simple_table(scan_df, audit, macro_hard_filter=macro_hard_filter, macro_strictness=macro_strictness)
-    st.session_state["macro_hard_filter"] = macro_hard_filter
-    st.session_state["macro_strictness"] = macro_strictness
+    st.session_state["simple_df"] = build_simple_table(scan_df, audit)
 
 price_df = st.session_state.get("price_df", pd.DataFrame())
 scan_df = st.session_state.get("scan_df", pd.DataFrame())
 audit = st.session_state.get("audit", None)
 universe_df = st.session_state.get("universe_df", pd.DataFrame())
 simple_df = st.session_state.get("simple_df", pd.DataFrame())
-macro_hard_filter = st.session_state.get("macro_hard_filter", True)
-macro_strictness = st.session_state.get("macro_strictness", "balanced")
 validation_result = st.session_state.get("validation_result", None)
 validation_panel = st.session_state.get("validation_panel", pd.DataFrame())
 
@@ -411,9 +391,6 @@ if audit is not None:
     cols[5].metric("Avoid / buang", int((simple_df["status_awam"] == "AVOID / BUANG").sum()) if isinstance(simple_df, pd.DataFrame) and not simple_df.empty else 0)
     cols[6].metric("Source mode", audit.get("source_mode", "n/a"))
     cols[7].metric("Bid-offer", "AKTIF" if micro_live else "BELUM AKTIF")
-    if isinstance(simple_df, pd.DataFrame) and not simple_df.empty and "route_summary" in simple_df.columns:
-        top_route = str(simple_df["route_summary"].mode().iloc[0])
-        st.caption("Macro route aktif: %s | Hard filter: %s (%s)" % (top_route, "ON" if macro_hard_filter else "OFF", macro_strictness))
     if audit.get("stale_warning"):
         st.warning(audit["stale_warning"])
     for w in audit.get("universe_warnings", []) or []:
@@ -434,10 +411,7 @@ if view == "Action View":
         work = simple_df.copy()
         if use_bid_offer and audit and (audit.get("done_rows", 0) > 0 or audit.get("orderbook_rows", 0) > 0):
             work = work.sort_values(["status_awam", "bid_offer_state", "entry_score", "score_confidence"], ascending=[True, True, False, False])
-        macro_focus = st.selectbox("Fokus macro state", options=["Semua", "ALIGNED", "NEXT_ROUTE", "CAUTION", "OFFSIDE"], index=0)
         top_bucket = st.selectbox("Fokus bucket", options=["Semua"] + BUCKET_ORDER, index=0)
-        if macro_focus != "Semua" and "macro_filter_state" in work.columns:
-            work = work[work["macro_filter_state"] == macro_focus].copy()
         if top_bucket != "Semua":
             work = work[work["status_awam"] == top_bucket].copy()
         for bucket in BUCKET_ORDER:
@@ -448,7 +422,7 @@ if view == "Action View":
             st.caption(BUCKET_HELP[bucket])
             cols = [
                 "ticker", "sector", "close", "status_awam", "bid_offer_state", "alasan_singkat", "trigger_singkat",
-                "invalidator_singkat", "timing", "confidence_text", "route_primary", "top_catalyst_title", "macro_filter_state"
+                "invalidator_singkat", "timing", "confidence_text", "route_primary", "top_catalyst_title"
             ]
             cols = [c for c in cols if c in bucket_df.columns]
             rename_map = {
@@ -464,7 +438,6 @@ if view == "Action View":
                 "confidence_text": "Confidence",
                 "route_primary": "Route",
                 "top_catalyst_title": "Catalyst",
-                "macro_filter_state": "Macro State",
             }
             show_df = bucket_df[cols].rename(columns=rename_map)
             st.dataframe(show_df, use_container_width=True, hide_index=True)
@@ -501,7 +474,6 @@ elif view == "Ticker Detail":
         st.markdown(f"**Why not yet:** {row.get('why_not_yet', '-')}")
         st.markdown(f"**Trigger:** {row.get('trigger', '-')}")
         st.markdown(f"**Invalidation:** {row.get('invalidator', '-')}")
-        st.markdown(f"**Macro state:** {row.get('macro_filter_state', '-')} | **Macro note:** {row.get('macro_note', '-')}")
         st.markdown(f"**Dominant risk:** {row.get('dominant_risk', '-')}")
         extra_cols = [c for c in [
             "trend_quality","breakout_integrity","false_breakout_risk","dry_score_final","wet_score_final",
@@ -526,7 +498,7 @@ elif view == "Advanced Table":
             "broker_alignment_score","broker_persistence_score","broker_mode","dominant_accumulator","dominant_distributor",
             "institutional_support","institutional_resistance","gulungan_up_score","gulungan_down_score","latest_event_label",
             "relative_strength_20d","sector_relative_strength_20d","long_rank_score","risk_rank_score","route_rank_score",
-            "route_primary","route_bias","forward_radar_bucket","top_catalyst_title","macro_filter_state","macro_gate_score","macro_note","why_now","why_not_yet","trigger","invalidator","dominant_risk"
+            "route_primary","route_bias","forward_radar_bucket","top_catalyst_title","why_now","why_not_yet","trigger","invalidator","dominant_risk"
         ] if c in simple_df.columns]
         st.dataframe(simple_df[cols], use_container_width=True, hide_index=True)
 
