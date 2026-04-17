@@ -179,6 +179,16 @@ def parse_orderbook_csv(file_bytes: bytes) -> pd.DataFrame:
     return df
 
 
+
+
+def _safe_numeric(series: pd.Series) -> pd.Series:
+    return pd.to_numeric(series, errors="coerce")
+
+
+def _safe_round(series: pd.Series, digits: int = 2) -> pd.Series:
+    return _safe_numeric(series).round(digits)
+
+
 # =============================
 # EOD analytics
 # =============================
@@ -533,8 +543,19 @@ def build_latest_scan(df: pd.DataFrame, broker_df: Optional[pd.DataFrame], burst
     latest = latest.merge(pd.DataFrame([c.__dict__ for c in broker_contexts]), on="ticker", how="left")
     latest = latest.merge(pd.DataFrame([c.__dict__ for c in burst_contexts]), on="ticker", how="left")
 
-    latest["institutional_support"] = latest["institutional_support"].round(2)
-    latest["institutional_resistance"] = latest["institutional_resistance"].round(2)
+    numeric_merge_cols = [
+        "institutional_support", "institutional_resistance", "broker_alignment_score",
+        "gulungan_up_score", "gulungan_down_score", "bullish_burst_score", "bearish_burst_score",
+        "bull_trap_score", "bear_trap_score", "absorption_after_up_score", "absorption_after_down_score",
+    ]
+    for c in numeric_merge_cols:
+        if c in latest.columns:
+            latest[c] = _safe_numeric(latest[c])
+
+    if "institutional_support" in latest.columns:
+        latest["institutional_support"] = _safe_round(latest["institutional_support"], 2)
+    if "institutional_resistance" in latest.columns:
+        latest["institutional_resistance"] = _safe_round(latest["institutional_resistance"], 2)
 
     latest["long_score"] = (
         0.22 * latest["trend_quality"].fillna(0)
@@ -588,7 +609,7 @@ def build_latest_scan(df: pd.DataFrame, broker_df: Optional[pd.DataFrame], burst
     ]
     for c in round_cols:
         if c in latest.columns:
-            latest[c] = latest[c].round(1)
+            latest[c] = _safe_round(latest[c], 1)
     latest = latest.sort_values(["verdict", "long_score", "bullish_burst_score"], ascending=[True, False, False])
     return latest
 
