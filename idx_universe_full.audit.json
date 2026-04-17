@@ -1,0 +1,31 @@
+{
+  "source_file": "Daftar Saham  - 20260417.xlsx",
+  "sheet_rows_including_header": 958,
+  "ticker_count": 957,
+  "first_10": [
+    "AADI",
+    "AALI",
+    "ABBA",
+    "ABDA",
+    "ABMM",
+    "ACES",
+    "ACRO",
+    "ACST",
+    "ADCP",
+    "ADES"
+  ],
+  "last_10": [
+    "YELO",
+    "YOII",
+    "YPAS",
+    "YULE",
+    "YUPI",
+    "ZATA",
+    "ZBRA",
+    "ZINC",
+    "ZONE",
+    "ZYRX"
+  ],
+  "contains_HUMI": true,
+  "generated_at": "2026-04-17T16:52:33.326040Z"
+}
