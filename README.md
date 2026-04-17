@@ -1,47 +1,17 @@
-# IDX Scanner V4.0 — Full Stack Base
+# IDX Scanner V4.5 — Intraday Hardening Max
 
-Deploy-safe single-file Streamlit app for scanning IDX names with:
-- full-universe loader (local CSV first, public web fallback, sample last)
-- batched yfinance `.JK` EOD fetch
-- price-side EOD scoring
-- optional broker summary import
-- optional done detail import
-- optional orderbook import
-- broker-aware dry/wet
-- institutional support / resistance proxy
-- intraday burst / gulungan up-down labels
-- confidence and explainability
+Deploy-safe single-file Streamlit scanner for IDX using free yfinance `.JK` EOD plus optional broker summary, done detail, and orderbook uploads.
+
+## Added in V4.5
+- stronger done detail normalization and aggressor inference
+- same-second split-order clustering
+- bidirectional burst engine with follow-through and trap scoring
+- orderbook refill / fake wall / absorption proxies
+- stronger confidence penalties when intraday context is missing
+- scanner verdicts now react to trap vs continuation, not just burst direction
 
 ## Run
-
 ```bash
 pip install -r requirements.txt
 streamlit run streamlit_app.py
 ```
-
-## Optional files
-
-Put a stable full-universe file in:
-
-`data/idx_universe_full.csv`
-
-with one column:
-
-```csv
-ticker
-BBCA
-BBRI
-BMRI
-...
-```
-
-## Notes
-
-This is still a research scanner, not a production execution engine.
-- EOD price-side uses free `yfinance`
-- broker/intraday layers require your own real CSV data
-- institutional levels are broker-flow proxies, not custody truth
-
-
-Additional optional input:
-- `data/broker_master_template.csv` for broker names / style hints.

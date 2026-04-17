@@ -28,6 +28,12 @@ def build_why_now(row: pd.Series) -> str:
     broker = _safe(row.get("broker_alignment_score"))
     persist = _safe(row.get("broker_persistence_score"))
     burst = _txt(row.get("latest_event_label"))
+    bull_trap = _safe(row.get("bull_trap_score"))
+    bear_trap = _safe(row.get("bear_trap_score"))
+    fake_wall_offer = _safe(row.get("fake_wall_offer_score"))
+    bull_trap = _safe(row.get("bull_trap_score"))
+    bear_trap = _safe(row.get("bear_trap_score"))
+    tension = _safe(row.get("tension_score"))
     phase = str(row.get("phase", "NEUTRAL"))
     regime = str(row.get("market_regime", "CHOPPY"))
     rs20 = _safe(row.get("relative_strength_20d"), default=0.0)
@@ -46,8 +52,14 @@ def build_why_now(row: pd.Series) -> str:
         bits.append("persistence broker bagus")
     if mode == "ACCUMULATION_DOMINANT":
         bits.append("akumulasi dominan")
-    if burst not in {"-", "NO_INTRADAY_SIGNAL", "NO_ORDERBOOK_UPLOAD"} and "UP_" in burst:
+    if burst not in {"-", "NO_INTRADAY_SIGNAL", "NO_ORDERBOOK_UPLOAD"}:
         bits.append(f"burst {burst.lower()}")
+    if tension >= 60:
+        bits.append("microstructure tegang")
+    if bull_trap >= 60:
+        bits.append("tetap hati-hati trap")
+    if bear_trap >= 60 and verdict == "WATCH_REBOUND":
+        bits.append("flush mulai matang")
     if phase not in {"NEUTRAL", "MARKDOWN"}:
         bits.append(f"fase {phase.lower()}")
     if regime in {"RISK_ON", "UPTREND_SELECTIVE"}:
@@ -69,6 +81,9 @@ def build_why_not_yet(row: pd.Series) -> str:
     bi = _safe(row.get("breakout_integrity"))
     fb = _safe(row.get("false_breakout_risk"))
     wet = _safe(row.get("wet_score_final", row.get("wet_score")))
+    bull_trap = _safe(row.get("bull_trap_score"))
+    bear_trap = _safe(row.get("bear_trap_score"))
+    absorb_up = _safe(row.get("absorption_after_up_score"))
     broker = _safe(row.get("broker_alignment_score"))
     overhang = _safe(row.get("overhang_score"))
     regime = str(row.get("market_regime", "CHOPPY"))
@@ -90,6 +105,12 @@ def build_why_not_yet(row: pd.Series) -> str:
         reasons.append("overhang distribusi masih tebal")
     if mode == "CHURN_HEAVY":
         reasons.append("broker masih churning")
+    if bull_trap >= 60:
+        reasons.append("burst atas masih rawan trap")
+    if absorb_up >= 60:
+        reasons.append("seller masih menyerap kenaikan")
+    if bear_trap >= 60 and verdict != "WATCH_REBOUND":
+        reasons.append("flush bawah belum selesai dibaca")
     if regime == "RISK_OFF":
         reasons.append("market sedang risk-off")
     return ", ".join(reasons[:5]) if reasons else "konfirmasi tambahan masih dibutuhkan"
@@ -139,10 +160,19 @@ def build_invalidator(row: pd.Series) -> str:
 def build_risk_note(row: pd.Series) -> str:
     notes = []
     wet = _safe(row.get("wet_score_final", row.get("wet_score")))
+    bull_trap = _safe(row.get("bull_trap_score"))
+    bear_trap = _safe(row.get("bear_trap_score"))
+    absorb_up = _safe(row.get("absorption_after_up_score"))
     fb = _safe(row.get("false_breakout_risk"))
     liq = _safe(row.get("liquidity_mn"))
     overhang = _safe(row.get("overhang_score"))
     burst = _txt(row.get("latest_event_label"))
+    bull_trap = _safe(row.get("bull_trap_score"))
+    bear_trap = _safe(row.get("bear_trap_score"))
+    fake_wall_offer = _safe(row.get("fake_wall_offer_score"))
+    bull_trap = _safe(row.get("bull_trap_score"))
+    bear_trap = _safe(row.get("bear_trap_score"))
+    tension = _safe(row.get("tension_score"))
     regime = str(row.get("market_regime", "CHOPPY"))
     mode = _txt(row.get("broker_mode"))
     if wet >= 60:
@@ -155,6 +185,12 @@ def build_risk_note(row: pd.Series) -> str:
         notes.append("overhang distribusi")
     if mode == "DISTRIBUTION_DOMINANT":
         notes.append("broker dominan buang barang")
+    if bull_trap >= 60:
+        notes.append("up-burst rawan trap")
+    if bear_trap >= 60:
+        notes.append("flush bawah rawan reversal")
+    if fake_wall_offer >= 65:
+        notes.append("offer wall rawan menahan harga")
     if burst.startswith("DOWN_"):
         notes.append("intraday bias masih bearish")
     if regime == "RISK_OFF":

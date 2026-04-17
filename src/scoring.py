@@ -169,6 +169,10 @@ def _compute_rank_scores(out: pd.DataFrame) -> pd.DataFrame:
     burst_dn = pd.to_numeric(out.get("gulungan_down_score", 0), errors="coerce").fillna(0.0)
     absorb_up = pd.to_numeric(out.get("absorption_after_up_score", 0), errors="coerce").fillna(0.0)
     absorb_dn = pd.to_numeric(out.get("absorption_after_down_score", 0), errors="coerce").fillna(0.0)
+    fu = pd.to_numeric(out.get("post_up_followthrough_score", 0), errors="coerce").fillna(0.0)
+    fd = pd.to_numeric(out.get("post_down_followthrough_score", 0), errors="coerce").fillna(0.0)
+    btrap = pd.to_numeric(out.get("bull_trap_score", 0), errors="coerce").fillna(0.0)
+    beartrap = pd.to_numeric(out.get("bear_trap_score", 0), errors="coerce").fillna(0.0)
 
     out["long_rank_score"] = (
         0.18 * tq
@@ -179,11 +183,13 @@ def _compute_rank_scores(out: pd.DataFrame) -> pd.DataFrame:
         + 0.08 * np.clip(rs20 * 1000, -20, 20)
         + 0.06 * np.clip(sec_rs * 1000, -15, 15)
         + 0.10 * conf
-        + 0.06 * market_bias
+        + 0.05 * market_bias
         + 0.06 * burst_up
+        + 0.05 * fu
         - 0.10 * fb
         - 0.05 * absorb_up
-        - 0.05 * overhang
+        - 0.05 * btrap
+        - 0.04 * overhang
     ).round(2)
     out["risk_rank_score"] = (
         0.18 * pd.to_numeric(out.get("wet_score_final", out.get("wet_score", 0)), errors="coerce").fillna(0.0)
@@ -191,6 +197,8 @@ def _compute_rank_scores(out: pd.DataFrame) -> pd.DataFrame:
         + 0.12 * overhang
         + 0.08 * burst_dn
         + 0.08 * absorb_dn
+        + 0.06 * fd
+        + 0.06 * beartrap
         + 0.08 * (100 - broker)
         + 0.08 * (50 - np.clip(rs20 * 500, -50, 50))
         + 0.10 * (100 - market_bias)
@@ -238,6 +246,11 @@ def compute_ticker_features(
         out["gulungan_down_score"] = np.nan
         out["effort_result_up"] = np.nan
         out["effort_result_down"] = np.nan
+        out["post_up_followthrough_score"] = np.nan
+        out["post_down_followthrough_score"] = np.nan
+        out["split_order_score"] = np.nan
+        out["bull_trap_score"] = np.nan
+        out["bear_trap_score"] = np.nan
         out["latest_event_label"] = "NO_INTRADAY_SIGNAL"
         out["burst_bias"] = "NEUTRAL"
         out["last_burst_ts"] = pd.NaT
@@ -250,6 +263,10 @@ def compute_ticker_features(
         out["absorption_after_down_score"] = np.nan
         out["tension_score"] = np.nan
         out["fragility_score"] = np.nan
+        out["offer_refill_rate"] = np.nan
+        out["bid_refill_rate"] = np.nan
+        out["fake_wall_offer_score"] = np.nan
+        out["fake_wall_bid_score"] = np.nan
     out = out.merge(drywet_ctx, on="ticker", how="left")
 
     out = _to_num(out, [
@@ -257,8 +274,9 @@ def compute_ticker_features(
         "dry_score_final", "wet_score_final", "liquidity_mn", "broker_alignment_score",
         "institutional_support", "institutional_resistance", "institutional_support_low", "institutional_support_high", "institutional_resistance_low", "institutional_resistance_high", "overhang_score",
         "gulungan_up_score", "gulungan_down_score", "effort_result_up", "effort_result_down",
+        "post_up_followthrough_score", "post_down_followthrough_score", "split_order_score", "bull_trap_score", "bear_trap_score",
         "bid_stack_quality", "offer_stack_quality", "absorption_after_up_score", "absorption_after_down_score",
-        "tension_score", "fragility_score", "support_20d", "resistance_60d", "relative_strength_20d",
+        "tension_score", "fragility_score", "offer_refill_rate", "bid_refill_rate", "fake_wall_offer_score", "fake_wall_bid_score", "support_20d", "resistance_60d", "relative_strength_20d",
         "broker_persistence_score", "broker_concentration_score", "broker_acc_pressure", "broker_dist_pressure", "float_lock_score", "supply_overhang_score",
         "sector_relative_strength_20d"
     ])
@@ -274,8 +292,17 @@ def compute_ticker_features(
     out["gulungan_down_score"] = out["gulungan_down_score"].fillna(0.0)
     out["effort_result_up"] = out["effort_result_up"].fillna(0.0)
     out["effort_result_down"] = out["effort_result_down"].fillna(0.0)
+    out["post_up_followthrough_score"] = out["post_up_followthrough_score"].fillna(0.0)
+    out["post_down_followthrough_score"] = out["post_down_followthrough_score"].fillna(0.0)
+    out["split_order_score"] = out["split_order_score"].fillna(0.0)
+    out["bull_trap_score"] = out["bull_trap_score"].fillna(0.0)
+    out["bear_trap_score"] = out["bear_trap_score"].fillna(0.0)
     out["absorption_after_up_score"] = out["absorption_after_up_score"].fillna(0.0)
     out["absorption_after_down_score"] = out["absorption_after_down_score"].fillna(0.0)
+    out["offer_refill_rate"] = out["offer_refill_rate"].fillna(0.0)
+    out["bid_refill_rate"] = out["bid_refill_rate"].fillna(0.0)
+    out["fake_wall_offer_score"] = out["fake_wall_offer_score"].fillna(0.0)
+    out["fake_wall_bid_score"] = out["fake_wall_bid_score"].fillna(0.0)
 
     out["market_regime"] = market_ctx.get("market_regime")
     out["execution_mode"] = market_ctx.get("execution_mode")
@@ -310,6 +337,13 @@ def compute_ticker_features(
         long_thr = get_long_thresholds(liq, regime)
         risk_thr = get_risk_thresholds(liq, regime)
 
+        fu = row.get("post_up_followthrough_score", 0.0)
+        fd = row.get("post_down_followthrough_score", 0.0)
+        bull_trap = row.get("bull_trap_score", 0.0)
+        bear_trap = row.get("bear_trap_score", 0.0)
+        split_score = row.get("split_order_score", 0.0)
+        fake_wall_offer = row.get("fake_wall_offer_score", 0.0)
+        fake_wall_bid = row.get("fake_wall_bid_score", 0.0)
         verdict = "NEUTRAL"
         if liq < 5:
             verdict = "ILLIQUID"
@@ -317,19 +351,23 @@ def compute_ticker_features(
             tq >= long_thr["tq"] and bi >= long_thr["bi"] and fb <= long_thr["fb"]
             and dry >= long_thr["dry"] and broker >= long_thr["broker"] and persistence >= 48
             and (pd.isna(rs20) or rs20 >= -0.01) and (pd.isna(sec_rs20) or sec_rs20 >= -0.01)
-            and not (up >= 60 and absorb_up >= 60) and dist_pressure < 65
+            and not (up >= 60 and (absorb_up >= 60 or bull_trap >= 60)) and dist_pressure < 65 and fu >= 45
         ):
             verdict = "READY_LONG"
         elif phase in {"MARKUP", "ACCUMULATION", "PULLBACK_HEALTHY"} and bi >= max(42, long_thr["bi"] - 10) and fb <= min(45, long_thr["fb"] + 8) and broker >= max(45, long_thr["broker"] - 10):
             verdict = "WATCH"
-        elif down >= 60 and absorb_down >= 60 and phase in {"MARKDOWN", "PULLBACK_HEALTHY"} and float_lock >= 45:
+        elif down >= 60 and (absorb_down >= 60 or bear_trap >= 60) and phase in {"MARKDOWN", "PULLBACK_HEALTHY"} and float_lock >= 40 and fd <= 55:
             verdict = "WATCH_REBOUND"
-        elif phase == "MARKDOWN" and (wet >= risk_thr["wet"] or overhang >= risk_thr["overhang"] or burst_bias == "BEARISH" or dist_pressure >= 60):
+        elif phase == "MARKDOWN" and (wet >= risk_thr["wet"] or overhang >= risk_thr["overhang"] or burst_bias == "BEARISH" or dist_pressure >= 60 or fd >= 50):
             verdict = "TRIM"
-        elif phase == "MARKDOWN" and (fb >= risk_thr["fb"] or broker < risk_thr["broker_low"]):
+        elif phase == "MARKDOWN" and (fb >= risk_thr["fb"] or broker < risk_thr["broker_low"] or fake_wall_offer >= 65):
             verdict = "AVOID"
-        elif phase == "PULLBACK_HEALTHY" and dry >= long_thr["dry"] and broker >= max(50, long_thr["broker"] - 5) and persistence >= 45:
+        elif phase == "PULLBACK_HEALTHY" and dry >= long_thr["dry"] and broker >= max(50, long_thr["broker"] - 5) and persistence >= 45 and bull_trap < 65:
             verdict = "WATCH_REBOUND"
+        elif up >= 60 and bull_trap >= 65:
+            verdict = "WATCH" if phase in {"ACCUMULATION", "PULLBACK_HEALTHY"} else "TRIM"
+        elif split_score >= 70 and fake_wall_offer >= 70 and up >= 55:
+            verdict = "WATCH"
         verdicts.append(verdict)
     out["verdict"] = verdicts
 
@@ -347,8 +385,8 @@ def compute_ticker_features(
         "close", "trend_quality", "breakout_integrity", "false_breakout_risk", "dry_score", "wet_score",
         "dry_score_final", "wet_score_final", "liquidity_mn", "broker_alignment_score", "institutional_support",
         "institutional_resistance", "overhang_score", "gulungan_up_score", "gulungan_down_score",
-        "effort_result_up", "effort_result_down", "bid_stack_quality", "offer_stack_quality",
-        "absorption_after_up_score", "absorption_after_down_score", "tension_score", "fragility_score",
+        "effort_result_up", "effort_result_down", "post_up_followthrough_score", "post_down_followthrough_score", "split_order_score", "bull_trap_score", "bear_trap_score", "bid_stack_quality", "offer_stack_quality",
+        "absorption_after_up_score", "absorption_after_down_score", "tension_score", "fragility_score", "offer_refill_rate", "bid_refill_rate", "fake_wall_offer_score", "fake_wall_bid_score",
         "score_confidence", "data_completeness_score", "module_agreement_score", "support_20d", "resistance_60d",
         "market_breadth_pct", "market_bias_score", "market_vol_state", "relative_strength_20d",
         "sector_relative_strength_20d", "long_rank_score", "risk_rank_score"

@@ -79,7 +79,7 @@ def render_candles(price_df: pd.DataFrame, ticker: str):
     st.plotly_chart(fig, use_container_width=True)
 
 
-st.title("IDX Scanner V4.2 — Full Mentok (Free EOD + Broker/Intraday Hooks)")
+st.title("IDX Scanner V4.5 — Intraday Hardening Max")
 st.caption("Full-universe resolver + disk cache + retry + broker/intraday hooks + sector-aware RS + explainability + ranking.")
 last_run = read_last_run(BASE_DIR)
 if last_run:
@@ -261,8 +261,8 @@ elif view == "Ticker Detail":
             "trend_quality","breakout_integrity","false_breakout_risk","dry_score_final","wet_score_final",
             "broker_alignment_score","broker_mode","overhang_score","support_20d","resistance_60d",
             "institutional_support","institutional_resistance","gulungan_up_score","gulungan_down_score",
-            "effort_result_up","effort_result_down","absorption_after_up_score","absorption_after_down_score",
-            "bid_stack_quality","offer_stack_quality","data_completeness_score","module_agreement_score",
+            "effort_result_up","effort_result_down","post_up_followthrough_score","post_down_followthrough_score","split_order_score","bull_trap_score","bear_trap_score","absorption_after_up_score","absorption_after_down_score",
+            "bid_stack_quality","offer_stack_quality","offer_refill_rate","bid_refill_rate","fake_wall_offer_score","fake_wall_bid_score","data_completeness_score","module_agreement_score",
             "market_breadth_pct","market_bias_score","relative_strength_20d","sector_relative_strength_20d",
             "long_rank_score","risk_rank_score"
         ]
@@ -278,15 +278,15 @@ elif view == "Ticker Detail":
         st.markdown(f"**Dominant risk:** {row['dominant_risk']}")
 
 elif view == "Intraday / Broker":
-    st.subheader("Intraday / Broker Context")
+    st.subheader("Intraday / Broker Context — Hardening")
     if scan_df.empty:
         st.info("Belum ada hasil scan.")
     else:
         cols = [
             "ticker", "sector", "broker_mode", "broker_alignment_score", "broker_persistence_score", "broker_concentration_score", "dominant_accumulator", "dominant_distributor",
             "institutional_support", "institutional_support_low", "institutional_support_high", "institutional_resistance", "institutional_resistance_low", "institutional_resistance_high", "overhang_score", "float_lock_score", "supply_overhang_score", "gulungan_up_score", "gulungan_down_score",
-            "effort_result_up", "effort_result_down", "latest_event_label", "burst_bias", "bid_stack_quality",
-            "offer_stack_quality", "absorption_after_up_score", "absorption_after_down_score", "tension_score", "fragility_score",
+            "effort_result_up", "effort_result_down", "post_up_followthrough_score", "post_down_followthrough_score", "split_order_score", "bull_trap_score", "bear_trap_score", "latest_event_label", "burst_bias", "bid_stack_quality",
+            "offer_stack_quality", "absorption_after_up_score", "absorption_after_down_score", "offer_refill_rate", "bid_refill_rate", "fake_wall_offer_score", "fake_wall_bid_score", "tension_score", "fragility_score",
             "data_completeness_score"
         ]
         cols = [c for c in cols if c in scan_df.columns]

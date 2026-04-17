@@ -3,7 +3,7 @@ from __future__ import annotations
 import numpy as np
 import pandas as pd
 
-MISSING_LABELS = {"", "-", "NO_INTRADAY_SIGNAL", "NO_BROKER_UPLOAD"}
+MISSING_LABELS = {"", "-", "NO_INTRADAY_SIGNAL", "NO_BROKER_UPLOAD", "UNKNOWN"}
 
 
 def _present_numeric(s: pd.Series) -> pd.Series:
@@ -23,6 +23,7 @@ def compute_confidence(df: pd.DataFrame) -> pd.DataFrame:
     latest_event = df.get("latest_event_label", pd.Series("NO_INTRADAY_SIGNAL", index=df.index)).astype(str)
     burst_present = (~latest_event.isin(MISSING_LABELS)).astype(float)
     order_present = _present_numeric(df.get("bid_stack_quality", pd.Series(np.nan, index=df.index)))
+    burst_quality_present = (_present_numeric(df.get("post_up_followthrough_score", pd.Series(np.nan, index=df.index))) + _present_numeric(df.get("bull_trap_score", pd.Series(np.nan, index=df.index)))) / 2
 
     broker_fields = [
         _present_numeric(df.get("institutional_support", pd.Series(np.nan, index=df.index))),
@@ -38,8 +39,9 @@ def compute_confidence(df: pd.DataFrame) -> pd.DataFrame:
         0.30 * price_present
         + 0.20 * broker_present
         + 0.20 * broker_field_present
-        + 0.15 * burst_present
-        + 0.15 * order_present
+        + 0.12 * burst_present
+        + 0.12 * order_present
+        + 0.06 * burst_quality_present
     )
     completeness = 100 * complete
 
@@ -108,7 +110,8 @@ def compute_confidence(df: pd.DataFrame) -> pd.DataFrame:
     agreement = 100 * np.clip(np.array(agreement), 0, 1)
     strong_verdict_penalty = np.where(verdict.isin(["READY_LONG", "TRIM", "AVOID"]) & (completeness < 70), 18.0, 0.0)
     broker_missing_penalty = np.where(verdict.isin(["READY_LONG", "TRIM", "AVOID"]) & broker_present.eq(0), 12.0, 0.0)
-    confidence = 0.48 * completeness + 0.52 * agreement - strong_verdict_penalty - broker_missing_penalty
+    intraday_missing_penalty = np.where(verdict.isin(["READY_LONG", "TRIM", "AVOID"]) & burst_present.eq(0), 8.0, 0.0)
+    confidence = 0.48 * completeness + 0.52 * agreement - strong_verdict_penalty - broker_missing_penalty - intraday_missing_penalty
 
     out["data_completeness_score"] = np.round(completeness, 1)
     out["module_agreement_score"] = np.round(agreement, 1)
