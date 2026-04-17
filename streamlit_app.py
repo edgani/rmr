@@ -20,6 +20,7 @@ from src.scoring import compute_ticker_features
 from src.universe import resolve_universe_source
 from src.route_overlay import derive_route_state, build_route_overlay
 from src.normalizers import normalize_uploaded_csv
+from src.validation import build_price_side_validation_panel, run_walk_forward_validation
 
 st.set_page_config(page_title="IDX Scanner V4.2 Maxed", layout="wide")
 BASE_DIR = Path(__file__).resolve().parent
@@ -117,7 +118,9 @@ with st.sidebar:
     orderbook_upload = st.file_uploader("Orderbook CSV", type=["csv"], key="orderbook")
     route_events_upload = st.file_uploader("Route / catalyst events CSV (optional)", type=["csv"], key="route_events")
 
+    st.subheader("Validation")
     run_scan = st.button("Run scanner", type="primary")
+    run_validation = st.button("Run validation")
 
 uploaded_universe_df = load_csv(uploaded_universe, "universe") if uploaded_universe else pd.DataFrame()
 broker_df = load_csv(broker_upload, "broker")
@@ -201,10 +204,25 @@ if run_scan:
     st.session_state["audit"] = audit
     st.session_state["universe_df"] = universe_df
 
+if run_validation:
+    if price_df.empty:
+        st.warning("Run scanner dulu supaya price history ada.")
+    else:
+        with st.spinner("Building validation panel..."):
+            panel = build_price_side_validation_panel(price_df, min_history=80, horizon=20)
+            if panel.empty:
+                st.warning("Validation panel kosong. Data belum cukup panjang untuk walk-forward.")
+            else:
+                val = run_walk_forward_validation(panel, score_col="long_rank_score", label_col="label_long_success", return_col="fwd_return", date_col="date", train_days=252*2, test_days=63, top_n=20)
+                st.session_state["validation_panel"] = panel
+                st.session_state["validation_result"] = val
+
 price_df = st.session_state.get("price_df", pd.DataFrame())
 scan_df = st.session_state.get("scan_df", pd.DataFrame())
 audit = st.session_state.get("audit", None)
 universe_df = st.session_state.get("universe_df", pd.DataFrame())
+validation_result = st.session_state.get("validation_result", None)
+validation_panel = st.session_state.get("validation_panel", pd.DataFrame())
 
 if audit is not None:
     cols = st.columns(10)
@@ -230,7 +248,7 @@ if audit is not None:
             if audit.get("batch_reports"):
                 st.dataframe(pd.DataFrame(audit["batch_reports"]), use_container_width=True, hide_index=True)
 
-view = st.radio("View", ["Scanner", "Top Ranks", "Ticker Detail", "Intraday / Broker", "Data Audit"], horizontal=True)
+view = st.radio("View", ["Scanner", "Top Ranks", "Ticker Detail", "Intraday / Broker", "Validation", "Data Audit"], horizontal=True)
 
 if view == "Scanner":
     st.subheader("Scanner Output")
@@ -327,6 +345,27 @@ elif view == "Intraday / Broker":
         ]
         cols = [c for c in cols if c in scan_df.columns]
         st.dataframe(scan_df[cols], use_container_width=True, hide_index=True)
+
+elif view == "Validation":
+    st.subheader("Walk-forward Validation")
+    st.caption("Price-side scaffold only. Useful for honesty checks, not proof of live alpha.")
+    if validation_result is None:
+        st.info("Klik Run validation setelah scanner jalan.")
+    else:
+        if validation_result.summary:
+            m1, m2, m3 = st.columns(3)
+            m1.metric("Mean AUC", round(validation_result.summary.get("auc", float("nan")), 3) if pd.notna(validation_result.summary.get("auc", float("nan"))) else "—")
+            m2.metric("Mean Precision@20", round(validation_result.summary.get("precision_at_20", float("nan")), 3) if pd.notna(validation_result.summary.get("precision_at_20", float("nan"))) else "—")
+            m3.metric("Mean Expectancy@20", round(validation_result.summary.get("expectancy_at_20", float("nan")), 4) if pd.notna(validation_result.summary.get("expectancy_at_20", float("nan"))) else "—")
+        if not validation_result.fold_metrics.empty:
+            st.markdown("### Fold metrics")
+            st.dataframe(validation_result.fold_metrics, use_container_width=True, hide_index=True)
+        if not validation_result.predictions.empty:
+            st.markdown("### Top validation predictions")
+            top_val = validation_result.predictions.sort_values(["fold", "long_rank_score"], ascending=[True, False]).groupby("fold").head(20)
+            st.dataframe(top_val, use_container_width=True, hide_index=True)
+        if isinstance(validation_panel, pd.DataFrame) and not validation_panel.empty:
+            st.download_button("Download validation panel CSV", data=validation_panel.to_csv(index=False).encode("utf-8"), file_name="idx_validation_panel.csv", mime="text/csv")
 
 else:
     st.subheader("Data Audit")

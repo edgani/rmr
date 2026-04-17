@@ -223,11 +223,16 @@ def _compute_rank_scores(out: pd.DataFrame) -> pd.DataFrame:
     persistence = _series_from_get(out, "broker_persistence_score", 0.0).fillna(0.0)
     overhang = _series_from_get(out, "overhang_score", 0.0).fillna(0.0)
     dry = _series_from_get(out, "dry_score_final", float("nan")).fillna(_series_from_get(out, "dry_score", 0.0)).fillna(0.0)
+    wet = _series_from_get(out, "wet_score_final", float("nan")).fillna(_series_from_get(out, "wet_score", 0.0)).fillna(0.0)
     bi = _series_from_get(out, "breakout_integrity", 0.0).fillna(0.0)
     tq = _series_from_get(out, "trend_quality", 0.0).fillna(0.0)
     fb = _series_from_get(out, "false_breakout_risk", 50.0).fillna(50.0)
     conf = _series_from_get(out, "score_confidence", 0.0).fillna(0.0)
+    completeness = _series_from_get(out, "data_completeness_score", 0.0).fillna(0.0)
+    agreement = _series_from_get(out, "module_agreement_score", 0.0).fillna(0.0)
     market_bias = _series_from_get(out, "market_bias_score", 50.0).fillna(50.0)
+    route_fit = _series_from_get(out, "route_fit_score", 0.5).fillna(0.5) * 100.0
+    catalyst = _series_from_get(out, "catalyst_window_score", 0.0).fillna(0.0) * 100.0
     burst_up = _series_from_get(out, "gulungan_up_score", 0.0).fillna(0.0)
     burst_dn = _series_from_get(out, "gulungan_down_score", 0.0).fillna(0.0)
     absorb_up = _series_from_get(out, "absorption_after_up_score", 0.0).fillna(0.0)
@@ -236,37 +241,64 @@ def _compute_rank_scores(out: pd.DataFrame) -> pd.DataFrame:
     fd = _series_from_get(out, "post_down_followthrough_score", 0.0).fillna(0.0)
     btrap = _series_from_get(out, "bull_trap_score", 0.0).fillna(0.0)
     beartrap = _series_from_get(out, "bear_trap_score", 0.0).fillna(0.0)
+    liq_bucket = out.get("liquidity_bucket", pd.Series("mid", index=out.index)).astype(str).str.lower()
 
-    out["long_rank_score"] = (
-        0.18 * tq
-        + 0.18 * bi
-        + 0.12 * dry
-        + 0.10 * broker
-        + 0.08 * persistence
-        + 0.08 * np.clip(rs20 * 1000, -20, 20)
-        + 0.06 * np.clip(sec_rs * 1000, -15, 15)
+    rs_scaled = np.clip(rs20 * 1000, -25, 25)
+    sec_rs_scaled = np.clip(sec_rs * 1000, -20, 20)
+    optional_penalty = np.where(completeness < 55, 8.0, 0.0) + np.where(agreement < 45, 6.0, 0.0)
+    optional_penalty += np.where((broker <= 0.0) & (persistence <= 0.0), 6.0, 0.0)
+    optional_penalty += np.where((burst_up <= 0.0) & (burst_dn <= 0.0), 4.0, 0.0)
+
+    long_rank = (
+        0.16 * tq
+        + 0.16 * bi
+        + 0.11 * dry
+        + 0.08 * broker
+        + 0.07 * persistence
+        + 0.07 * rs_scaled
+        + 0.05 * sec_rs_scaled
         + 0.10 * conf
-        + 0.05 * market_bias
-        + 0.06 * burst_up
-        + 0.05 * fu
-        - 0.10 * fb
+        + 0.05 * completeness
+        + 0.05 * agreement
+        + 0.06 * market_bias
+        + 0.08 * route_fit
+        + 0.05 * catalyst
+        + 0.05 * burst_up
+        + 0.04 * fu
+        - 0.09 * fb
         - 0.05 * absorb_up
         - 0.05 * btrap
         - 0.04 * overhang
-    ).round(2)
-    out["risk_rank_score"] = (
-        0.18 * _series_from_get(out, "wet_score_final", float("nan")).fillna(_series_from_get(out, "wet_score", 0.0)).fillna(0.0)
-        + 0.14 * fb
+        - optional_penalty
+    )
+
+    # Liquidity-bucket adjustments: stricter for micro/small names.
+    micro_adj = np.where(liq_bucket.eq("micro"), -6.0, 0.0)
+    small_adj = np.where(liq_bucket.eq("small"), -3.0, 0.0)
+    large_bonus = np.where(liq_bucket.eq("large"), 2.0, 0.0)
+    long_rank = long_rank + micro_adj + small_adj + large_bonus
+
+    risk_rank = (
+        0.16 * wet
+        + 0.13 * fb
         + 0.12 * overhang
-        + 0.08 * burst_dn
-        + 0.08 * absorb_dn
+        + 0.07 * burst_dn
+        + 0.07 * absorb_dn
         + 0.06 * fd
         + 0.06 * beartrap
-        + 0.08 * (100 - broker)
-        + 0.08 * (50 - np.clip(rs20 * 500, -50, 50))
-        + 0.10 * (100 - market_bias)
-        + 0.14 * (100 - conf)
-    ).round(2)
+        + 0.07 * (100 - broker)
+        + 0.06 * np.maximum(0.0, 50 - rs_scaled)
+        + 0.08 * (100 - market_bias)
+        + 0.12 * (100 - conf)
+        + 0.05 * (100 - completeness)
+        + 0.05 * (100 - agreement)
+        + 0.06 * np.maximum(0.0, 60 - route_fit)
+    ) + np.where(liq_bucket.eq("micro"), 5.0, 0.0) + np.where(liq_bucket.eq("small"), 2.0, 0.0)
+
+    out["long_rank_score"] = pd.Series(np.clip(long_rank, 0.0, 100.0), index=out.index).round(2)
+    out["risk_rank_score"] = pd.Series(np.clip(risk_rank, 0.0, 100.0), index=out.index).round(2)
+    out["route_rank_score"] = pd.Series(np.clip(0.45 * route_fit + 0.20 * catalyst + 0.15 * conf + 0.10 * completeness + 0.10 * agreement, 0.0, 100.0), index=out.index).round(2)
+    out["rank_bucket"] = pd.cut(out["long_rank_score"], bins=[-1, 35, 50, 65, 80, 101], labels=["LOW", "WATCHLIST", "GOOD", "STRONG", "TOP"]).astype(str)
     return out
 
 
