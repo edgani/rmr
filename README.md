@@ -56,3 +56,7 @@ Untuk full universe, app download data secara **batch** supaya lebih tahan terha
 - Full universe gratis itu **praktis**, tapi tidak akan sebersih data berlisensi / official feed.
 - Broker / done detail / orderbook layer masih bergantung pada file yang lu upload.
 - Ini belum full production Hengky-style engine, tapi sudah naik dari EOD price-side ke broker + intraday burst layer.
+
+
+## V3.3 full-universe fetch
+Full-universe loader sekarang mencoba official IDX stock-list pages, Wikipedia HTML, dan MediaWiki raw/API sebelum jatuh ke sample universe.

@@ -88,18 +88,20 @@ def _extract_symbols_from_table(df: pd.DataFrame) -> list[str]:
 
 @st.cache_data(show_spinner=False, ttl=60 * 60 * 12)
 def fetch_full_ihsg_universe() -> tuple[list[str], str]:
+    sample_vals: list[str] = []
     for local_path in ["data/idx_universe_full.csv", "data/idx_universe_sample.csv"]:
         try:
             df = pd.read_csv(local_path)
             vals = _clean_symbol_list(df.iloc[:, 0].tolist())
             if local_path.endswith("full.csv") and len(vals) >= 400:
                 return vals, f"local:{local_path}"
-            if local_path.endswith("sample.csv") and len(vals) >= 50:
+            if local_path.endswith("sample.csv") and len(vals) >= 8:
                 sample_vals = vals
         except Exception:
             pass
 
     headers = {"User-Agent": "Mozilla/5.0"}
+
     official_urls = [
         "https://www.idx.co.id/id/data-pasar/data-saham/daftar-saham/",
         "https://www.idx.co.id/en/market-data/stocks-data/stock-list",
@@ -109,7 +111,7 @@ def fetch_full_ihsg_universe() -> tuple[list[str], str]:
             resp = requests.get(url, headers=headers, timeout=20)
             if resp.ok and resp.text:
                 html = resp.text
-                regex_vals = _clean_symbol_list(re.findall(r">\s*([A-Z]{4,5})\s*<", html))
+                regex_vals = _clean_symbol_list(re.findall(r">\s*([A-Z0-9]{4,5})\s*<", html))
                 if len(regex_vals) >= 400:
                     return regex_vals, f"official_idx_regex:{url}"
                 for tbl in pd.read_html(io.StringIO(html)):
@@ -121,20 +123,44 @@ def fetch_full_ihsg_universe() -> tuple[list[str], str]:
 
     wiki_url = "https://en.wikipedia.org/wiki/IDX_Composite"
     try:
-        tables = pd.read_html(wiki_url)
-        best: list[str] = []
-        for tbl in tables:
-            vals = _extract_symbols_from_table(tbl)
-            if len(vals) > len(best):
-                best = vals
-        if len(best) >= 400:
-            return best, f"wikipedia:{wiki_url}"
+        resp = requests.get(wiki_url, headers=headers, timeout=20)
+        if resp.ok and resp.text:
+            html = resp.text
+            segment = html
+            m1 = re.search(r"Components.*?currently lists.*?(?:As for Sharia Index|ISSI)", html, re.I | re.S)
+            if m1:
+                segment = m1.group(0)
+            vals = _clean_symbol_list(re.findall(r">\s*([A-Z0-9]{4,5})\s*<", segment))
+            if len(vals) >= 400:
+                return vals, f"wiki_html_regex:{wiki_url}"
+            for tbl in pd.read_html(io.StringIO(html)):
+                vals = _extract_symbols_from_table(tbl)
+                if len(vals) >= 400:
+                    return vals, f"wiki_html_table:{wiki_url}"
     except Exception:
         pass
 
-    vals = safe_read_universe()
-    return vals, "fallback_sample"
+    api_urls = [
+        "https://en.wikipedia.org/w/index.php?title=IDX_Composite&action=raw",
+        "https://en.wikipedia.org/w/api.php?action=query&prop=revisions&titles=IDX_Composite&rvslots=main&rvprop=content&format=json",
+    ]
+    for url in api_urls:
+        try:
+            resp = requests.get(url, headers=headers, timeout=20)
+            if not resp.ok or not resp.text:
+                continue
+            txt = resp.text
+            vals = _clean_symbol_list(re.findall(r"\|\s*\d+\s*\|\|\s*([A-Z0-9]{4,5})\s*\|\|", txt))
+            if len(vals) >= 400:
+                return vals, f"wiki_raw:{url}"
+            vals = _clean_symbol_list(re.findall(r"\\n\|\s*\d+\s*\|\|\s*([A-Z0-9]{4,5})\s*\|\|", txt))
+            if len(vals) >= 400:
+                return vals, f"wiki_api_regex:{url}"
+        except Exception:
+            pass
 
+    vals = sample_vals or safe_read_universe()
+    return vals, "fallback_sample"
 
 def _download_chunk(symbols: list[str], period: str, interval: str) -> pd.DataFrame:
     raw = yf.download(
@@ -765,7 +791,7 @@ def setup_text(row: pd.Series) -> str:
 # Streamlit UI
 # =============================
 
-st.title("IDX EOD Scanner V3.2 — Full IHSG Ready")
+st.title("IDX EOD Scanner V3.3 — Full IHSG Scanner")
 st.caption("Single-file IDX scanner: yfinance `.JK` untuk EOD real, optional broker summary + done detail + orderbook import untuk burst/gulungan up-down dan trap vs continuation. Sekarang support full universe IHSG via free auto-fetch + batching.")
 
 with st.sidebar:
@@ -777,6 +803,8 @@ with st.sidebar:
     manual_text = st.text_area("Manual tickers (comma separated)", value=default_manual, height=150, disabled=universe_choice != "Manual input")
     if universe_choice == "Full IHSG (free auto-fetch)":
         st.caption(f"Universe source: {full_universe_source} | symbols: {len(full_tickers)}")
+        if full_universe_source == "fallback_sample":
+            st.warning("Full-universe source gagal kebaca, jadi app jatuh ke sample universe. Upload data/idx_universe_full.csv atau coba rerun.")
     period = st.selectbox("History", ["6mo", "12mo", "18mo", "24mo"], index=1)
     fetch_chunk = st.slider("yfinance batch size", 20, 120, 80, 10)
     max_tickers = st.number_input("Max tickers (0 = all)", min_value=0, max_value=2000, value=0, step=50)
