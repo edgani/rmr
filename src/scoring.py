@@ -31,10 +31,47 @@ def _series_from_get(out: pd.DataFrame, key: str, default=0.0) -> pd.Series:
         return pd.Series(default, index=out.index, dtype=float)
 
 def _to_num(df: pd.DataFrame, cols: list[str]) -> pd.DataFrame:
+    if not isinstance(df, pd.DataFrame):
+        df = pd.DataFrame(df if df is not None else {})
     for c in cols:
         if c in df.columns:
             df[c] = pd.to_numeric(df[c], errors="coerce")
     return df
+
+
+def _ensure_df(obj, required_cols: list[str] | None = None) -> pd.DataFrame:
+    if isinstance(obj, pd.DataFrame):
+        df = obj.copy()
+    elif obj is None:
+        df = pd.DataFrame()
+    elif isinstance(obj, pd.Series):
+        df = obj.to_frame().T
+    else:
+        try:
+            df = pd.DataFrame(obj)
+        except Exception:
+            df = pd.DataFrame()
+    if required_cols:
+        for c in required_cols:
+            if c not in df.columns:
+                df[c] = pd.NA
+    return df
+
+
+def _safe_merge(left, right, on: str = "ticker", how: str = "left") -> pd.DataFrame:
+    ldf = _ensure_df(left)
+    rdf = _ensure_df(right)
+    if ldf.empty:
+        return ldf
+    if on not in ldf.columns:
+        return ldf
+    if rdf.empty or on not in rdf.columns:
+        return ldf
+    try:
+        return ldf.merge(rdf, on=on, how=how)
+    except Exception:
+        rdf = rdf.drop_duplicates(on) if on in rdf.columns else rdf
+        return ldf.merge(rdf, on=on, how=how)
 
 
 def compute_price_side_features(price_df: pd.DataFrame) -> pd.DataFrame:
@@ -147,20 +184,33 @@ def compute_price_side_features(price_df: pd.DataFrame) -> pd.DataFrame:
 
 
 def _add_metadata_and_sector_features(out: pd.DataFrame, metadata_df: pd.DataFrame | None) -> pd.DataFrame:
-    if metadata_df is None or metadata_df.empty:
+    out = _ensure_df(out, required_cols=["ticker", "ret20"])
+    if out.empty:
+        return out
+    if metadata_df is None:
         out["sector"] = pd.NA
         out["sector_relative_strength_20d"] = np.nan
         return out
-    meta = metadata_df.copy()
+    meta = _ensure_df(metadata_df)
+    if meta.empty:
+        out["sector"] = pd.NA
+        out["sector_relative_strength_20d"] = np.nan
+        return out
+    lowered = {str(c).lower().strip(): c for c in meta.columns}
+    if "ticker" not in meta.columns:
+        for cand in ["ticker", "code", "symbol", "stock code", "ticker code"]:
+            if cand in lowered:
+                meta = meta.rename(columns={lowered[cand]: "ticker"})
+                break
     if "ticker" not in meta.columns:
         meta = meta.rename(columns={meta.columns[0]: "ticker"})
     meta["ticker"] = meta["ticker"].astype(str).str.upper().str.replace(".JK", "", regex=False)
     keep = [c for c in ["ticker", "sector", "board", "name"] if c in meta.columns]
-    meta = meta[keep].drop_duplicates("ticker")
-    out = out.merge(meta, on="ticker", how="left")
-    if "sector" in out.columns and out["sector"].notna().any():
+    meta = meta[keep].drop_duplicates("ticker") if keep else pd.DataFrame(columns=["ticker"])
+    out = _safe_merge(out, meta, on="ticker", how="left")
+    if "sector" in out.columns and out["sector"].notna().any() and "ret20" in out.columns:
         sector_med = out.groupby("sector", dropna=True)["ret20"].transform("median")
-        out["sector_relative_strength_20d"] = out["ret20"] - sector_med
+        out["sector_relative_strength_20d"] = pd.to_numeric(out["ret20"], errors="coerce") - pd.to_numeric(sector_med, errors="coerce")
     else:
         out["sector_relative_strength_20d"] = np.nan
     return out
@@ -241,7 +291,7 @@ def compute_ticker_features(
     drywet_ctx = compute_broker_aware_drywet(out, broker_ctx)
 
     if not broker_ctx.empty:
-        out = out.merge(broker_ctx, on="ticker", how="left")
+        out = _safe_merge(out, broker_ctx, on="ticker", how="left")
     else:
         out["broker_alignment_score"] = np.nan
         out["broker_mode"] = "NO_BROKER_UPLOAD"
@@ -253,7 +303,7 @@ def compute_ticker_features(
         out["broker_concentration_score"] = np.nan
         out["broker_data_days"] = 0
     if not burst_ctx.empty:
-        out = out.merge(burst_ctx, on="ticker", how="left")
+        out = _safe_merge(out, burst_ctx, on="ticker", how="left")
     else:
         out["gulungan_up_score"] = np.nan
         out["gulungan_down_score"] = np.nan
@@ -268,7 +318,7 @@ def compute_ticker_features(
         out["burst_bias"] = "NEUTRAL"
         out["last_burst_ts"] = pd.NaT
     if not book_ctx.empty:
-        out = out.merge(book_ctx, on="ticker", how="left")
+        out = _safe_merge(out, book_ctx, on="ticker", how="left")
     else:
         out["bid_stack_quality"] = np.nan
         out["offer_stack_quality"] = np.nan
@@ -280,7 +330,7 @@ def compute_ticker_features(
         out["bid_refill_rate"] = np.nan
         out["fake_wall_offer_score"] = np.nan
         out["fake_wall_bid_score"] = np.nan
-    out = out.merge(drywet_ctx, on="ticker", how="left")
+    out = _safe_merge(out, drywet_ctx, on="ticker", how="left")
 
     out = _to_num(out, [
         "trend_quality", "breakout_integrity", "false_breakout_risk", "dry_score", "wet_score",
@@ -335,9 +385,9 @@ def compute_ticker_features(
         liq = row["liquidity_mn"]
         broker = row["broker_alignment_score"]
         overhang = row["overhang_score"]
-        persistence = row.get("broker_persistence_score", 0.0)
-        dist_pressure = row.get("broker_dist_pressure", 0.0)
-        float_lock = row.get("float_lock_score", 0.0)
+        persistence = float(pd.to_numeric(row.get("broker_persistence_score", 0.0), errors="coerce") if pd.notna(pd.to_numeric(row.get("broker_persistence_score", 0.0), errors="coerce")) else 0.0)
+        dist_pressure = float(pd.to_numeric(row.get("broker_dist_pressure", 0.0), errors="coerce") if pd.notna(pd.to_numeric(row.get("broker_dist_pressure", 0.0), errors="coerce")) else 0.0)
+        float_lock = float(pd.to_numeric(row.get("float_lock_score", 0.0), errors="coerce") if pd.notna(pd.to_numeric(row.get("float_lock_score", 0.0), errors="coerce")) else 0.0)
         burst_bias = str(row.get("burst_bias", "NEUTRAL"))
         up = row["gulungan_up_score"]
         down = row["gulungan_down_score"]
@@ -385,7 +435,7 @@ def compute_ticker_features(
     out["verdict"] = verdicts
 
     conf = compute_confidence(out)
-    out = out.merge(conf, on="ticker", how="left")
+    out = _safe_merge(out, conf, on="ticker", how="left")
     out = _compute_rank_scores(out)
 
     out["why_now"] = out.apply(build_why_now, axis=1)
