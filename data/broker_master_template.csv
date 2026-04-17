@@ -1,0 +1,5 @@
+broker_code,broker_name,style_hint,desk_hint
+AI,Sample Broker A,INSTITUTIONAL,PROP
+YU,Sample Broker B,INSTITUTIONAL,RETAIL_BIG
+YP,Sample Broker C,RETAIL,ONLINE
+XC,Sample Broker D,RETAIL,ONLINE

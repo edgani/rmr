@@ -157,6 +157,8 @@ def _compute_rank_scores(out: pd.DataFrame) -> pd.DataFrame:
     rs20 = pd.to_numeric(out.get("relative_strength_20d", 0), errors="coerce").fillna(0.0)
     sec_rs = pd.to_numeric(out.get("sector_relative_strength_20d", 0), errors="coerce").fillna(0.0)
     broker = pd.to_numeric(out.get("broker_alignment_score", 0), errors="coerce").fillna(0.0)
+    persistence = pd.to_numeric(out.get("broker_persistence_score", 0), errors="coerce").fillna(0.0)
+    overhang = pd.to_numeric(out.get("overhang_score", 0), errors="coerce").fillna(0.0)
     dry = pd.to_numeric(out.get("dry_score_final", out.get("dry_score", 0)), errors="coerce").fillna(0.0)
     bi = pd.to_numeric(out.get("breakout_integrity", 0), errors="coerce").fillna(0.0)
     tq = pd.to_numeric(out.get("trend_quality", 0), errors="coerce").fillna(0.0)
@@ -172,19 +174,21 @@ def _compute_rank_scores(out: pd.DataFrame) -> pd.DataFrame:
         0.18 * tq
         + 0.18 * bi
         + 0.12 * dry
-        + 0.12 * broker
+        + 0.10 * broker
+        + 0.08 * persistence
         + 0.08 * np.clip(rs20 * 1000, -20, 20)
         + 0.06 * np.clip(sec_rs * 1000, -15, 15)
         + 0.10 * conf
         + 0.06 * market_bias
         + 0.06 * burst_up
         - 0.10 * fb
-        - 0.06 * absorb_up
+        - 0.05 * absorb_up
+        - 0.05 * overhang
     ).round(2)
     out["risk_rank_score"] = (
         0.18 * pd.to_numeric(out.get("wet_score_final", out.get("wet_score", 0)), errors="coerce").fillna(0.0)
         + 0.14 * fb
-        + 0.12 * pd.to_numeric(out.get("overhang_score", 0), errors="coerce").fillna(0.0)
+        + 0.12 * overhang
         + 0.08 * burst_dn
         + 0.08 * absorb_dn
         + 0.08 * (100 - broker)
@@ -201,6 +205,7 @@ def compute_ticker_features(
     done_df: pd.DataFrame | None = None,
     orderbook_df: pd.DataFrame | None = None,
     metadata_df: pd.DataFrame | None = None,
+    broker_master_df: pd.DataFrame | None = None,
 ) -> pd.DataFrame:
     out = compute_price_side_features(price_df)
     if out.empty:
@@ -209,7 +214,7 @@ def compute_ticker_features(
     out = _add_metadata_and_sector_features(out, metadata_df)
 
     market_ctx = compute_market_regime(price_df).iloc[0].to_dict()
-    broker_ctx = compute_broker_context(broker_df if broker_df is not None else pd.DataFrame())
+    broker_ctx = compute_broker_context(broker_df if broker_df is not None else pd.DataFrame(), broker_master_df=broker_master_df)
     burst_ctx = compute_done_bursts(done_df if done_df is not None else pd.DataFrame())
     book_ctx = compute_orderbook_context(orderbook_df if orderbook_df is not None else pd.DataFrame())
     drywet_ctx = compute_broker_aware_drywet(out, broker_ctx)
@@ -250,10 +255,11 @@ def compute_ticker_features(
     out = _to_num(out, [
         "trend_quality", "breakout_integrity", "false_breakout_risk", "dry_score", "wet_score",
         "dry_score_final", "wet_score_final", "liquidity_mn", "broker_alignment_score",
-        "institutional_support", "institutional_resistance", "overhang_score",
+        "institutional_support", "institutional_resistance", "institutional_support_low", "institutional_support_high", "institutional_resistance_low", "institutional_resistance_high", "overhang_score",
         "gulungan_up_score", "gulungan_down_score", "effort_result_up", "effort_result_down",
         "bid_stack_quality", "offer_stack_quality", "absorption_after_up_score", "absorption_after_down_score",
         "tension_score", "fragility_score", "support_20d", "resistance_60d", "relative_strength_20d",
+        "broker_persistence_score", "broker_concentration_score", "broker_acc_pressure", "broker_dist_pressure", "float_lock_score", "supply_overhang_score",
         "sector_relative_strength_20d"
     ])
 
@@ -261,6 +267,9 @@ def compute_ticker_features(
     out["wet_score_final"] = out["wet_score_final"].fillna(out["wet_score"])
     out["broker_alignment_score"] = out["broker_alignment_score"].fillna(0.0)
     out["overhang_score"] = out["overhang_score"].fillna(0.0)
+    for c in ["broker_persistence_score", "broker_concentration_score", "broker_acc_pressure", "broker_dist_pressure", "float_lock_score", "supply_overhang_score"]:
+        if c in out.columns:
+            out[c] = pd.to_numeric(out[c], errors="coerce").fillna(0.0)
     out["gulungan_up_score"] = out["gulungan_up_score"].fillna(0.0)
     out["gulungan_down_score"] = out["gulungan_down_score"].fillna(0.0)
     out["effort_result_up"] = out["effort_result_up"].fillna(0.0)
@@ -286,6 +295,9 @@ def compute_ticker_features(
         liq = row["liquidity_mn"]
         broker = row["broker_alignment_score"]
         overhang = row["overhang_score"]
+        persistence = row.get("broker_persistence_score", 0.0)
+        dist_pressure = row.get("broker_dist_pressure", 0.0)
+        float_lock = row.get("float_lock_score", 0.0)
         burst_bias = str(row.get("burst_bias", "NEUTRAL"))
         up = row["gulungan_up_score"]
         down = row["gulungan_down_score"]
@@ -303,20 +315,20 @@ def compute_ticker_features(
             verdict = "ILLIQUID"
         elif (
             tq >= long_thr["tq"] and bi >= long_thr["bi"] and fb <= long_thr["fb"]
-            and dry >= long_thr["dry"] and broker >= long_thr["broker"]
+            and dry >= long_thr["dry"] and broker >= long_thr["broker"] and persistence >= 48
             and (pd.isna(rs20) or rs20 >= -0.01) and (pd.isna(sec_rs20) or sec_rs20 >= -0.01)
-            and not (up >= 60 and absorb_up >= 60)
+            and not (up >= 60 and absorb_up >= 60) and dist_pressure < 65
         ):
             verdict = "READY_LONG"
-        elif phase in {"MARKUP", "ACCUMULATION", "PULLBACK_HEALTHY"} and bi >= max(42, long_thr["bi"] - 10) and fb <= min(45, long_thr["fb"] + 8):
+        elif phase in {"MARKUP", "ACCUMULATION", "PULLBACK_HEALTHY"} and bi >= max(42, long_thr["bi"] - 10) and fb <= min(45, long_thr["fb"] + 8) and broker >= max(45, long_thr["broker"] - 10):
             verdict = "WATCH"
-        elif down >= 60 and absorb_down >= 60 and phase in {"MARKDOWN", "PULLBACK_HEALTHY"}:
+        elif down >= 60 and absorb_down >= 60 and phase in {"MARKDOWN", "PULLBACK_HEALTHY"} and float_lock >= 45:
             verdict = "WATCH_REBOUND"
-        elif phase == "MARKDOWN" and (wet >= risk_thr["wet"] or overhang >= risk_thr["overhang"] or burst_bias == "BEARISH"):
+        elif phase == "MARKDOWN" and (wet >= risk_thr["wet"] or overhang >= risk_thr["overhang"] or burst_bias == "BEARISH" or dist_pressure >= 60):
             verdict = "TRIM"
         elif phase == "MARKDOWN" and (fb >= risk_thr["fb"] or broker < risk_thr["broker_low"]):
             verdict = "AVOID"
-        elif phase == "PULLBACK_HEALTHY" and dry >= long_thr["dry"] and broker >= max(50, long_thr["broker"] - 5):
+        elif phase == "PULLBACK_HEALTHY" and dry >= long_thr["dry"] and broker >= max(50, long_thr["broker"] - 5) and persistence >= 45:
             verdict = "WATCH_REBOUND"
         verdicts.append(verdict)
     out["verdict"] = verdicts

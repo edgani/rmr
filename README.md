@@ -1,36 +1,47 @@
+# IDX Scanner V4.0 — Full Stack Base
 
-# IDX EOD Scanner V4.3 — Next Play Overlay
-
-Single-file Streamlit app with a deploy-safe scanner plus a next-play overlay inspired by the uploaded `app(209).py`.
-
-What it ports from the uploaded macro app:
-- route state overlay
-- asset translation
-- analog prior
-- most hated rally monitor
-- upcoming events
-- top drivers now
-- forward radar
-- data honesty banner
-
-What it does **not** claim:
-- full MacroRegime parity
-- broker/intraday truth without your real uploads
-- production alpha
+Deploy-safe single-file Streamlit app for scanning IDX names with:
+- full-universe loader (local CSV first, public web fallback, sample last)
+- batched yfinance `.JK` EOD fetch
+- price-side EOD scoring
+- optional broker summary import
+- optional done detail import
+- optional orderbook import
+- broker-aware dry/wet
+- institutional support / resistance proxy
+- intraday burst / gulungan up-down labels
+- confidence and explainability
 
 ## Run
+
 ```bash
 pip install -r requirements.txt
 streamlit run streamlit_app.py
 ```
 
-## Universe
-Prefer putting your own full list in `data/idx_universe_full.csv` with:
+## Optional files
+
+Put a stable full-universe file in:
+
+`data/idx_universe_full.csv`
+
+with one column:
+
 ```csv
-ticker,sector
-BBCA,Banks
-BBRI,Banks
+ticker
+BBCA
+BBRI
+BMRI
 ...
 ```
 
-Then point the sidebar input to that file.
+## Notes
+
+This is still a research scanner, not a production execution engine.
+- EOD price-side uses free `yfinance`
+- broker/intraday layers require your own real CSV data
+- institutional levels are broker-flow proxies, not custody truth
+
+
+Additional optional input:
+- `data/broker_master_template.csv` for broker names / style hints.
