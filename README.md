@@ -26,3 +26,7 @@ streamlit run streamlit_app.py
 
 ## Input normalizer hardening
 This build adds aggressive CSV normalization for universe/metadata, broker summary, broker master, done detail, orderbook, and route/catalyst events. Common alias columns, mixed casing, noisy currency text, and decimal comma formats are normalized automatically before scoring.
+
+
+## V5.0 Action View
+Default view sekarang dibikin lebih gampang dibaca untuk orang awam: 6 bucket action, trigger, invalidation, timing, dan confidence.
