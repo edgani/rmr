@@ -1,27 +1,24 @@
-# IDX Front-Run From Scratch (Full Universe Ready)
+# IDX Buy-Side Front-Run Board
 
-Paket ini sudah include `data/idx_universe_full.csv` hasil dari file IDX yang diupload user
-dengan total 957 ticker.
+Deploy-safe single-file Streamlit app.
+
+## What it does
+- Uses `data/idx_universe_full.csv` as source-of-truth universe.
+- Pulls EOD prices from Yahoo Finance (`.JK`).
+- Splits names into two buy-side boards:
+  - **OPPORTUNITY SEKARANG**
+  - **FRONT-RUN MARKET**
+- Shows audit for target / loaded / failed / coverage.
 
 ## Run
+
 ```bash
 pip install -r requirements.txt
 streamlit run streamlit_app.py
 ```
 
-## Apa yang ada
-- full universe lokal: `data/idx_universe_full.csv`
-- price fetch via `yfinance` `.JK`
-- 2 papan utama:
-  - OPPORTUNITY SEKARANG
-  - FRONT-RUN MARKET
-- Data Audit:
-  - target ticker
-  - loaded
-  - failed
-  - coverage
+## Rebuild universe from IDX Excel
 
-## Catatan
-- Harga tetap tergantung coverage / keberhasilan fetch `yfinance`
-- Universe master sudah dari file IDX upload, jadi tidak lagi fallback ke 364 / sample kecil
-- Sector masih kosong karena file IDX sumber tidak punya kolom sector
+```bash
+python scripts/build_universe_from_idx_xlsx.py --input "Daftar Saham - 20260417.xlsx" --output data/idx_universe_full.csv
+```

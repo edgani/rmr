@@ -1,42 +1,34 @@
-
+from __future__ import annotations
 import argparse
+from pathlib import Path
 import pandas as pd
 
-MONTH_MAP = {"Jan":"Jan","Feb":"Feb","Mar":"Mar","Apr":"Apr","Mei":"May","Jun":"Jun","Jul":"Jul","Agu":"Aug","Sep":"Sep","Okt":"Oct","Nov":"Nov","Des":"Dec"}
 
-def parse_id_date(s):
-    if pd.isna(s):
-        return ""
-    s = str(s).strip()
-    parts = s.split()
-    if len(parts) == 3:
-        d, m, y = parts
-        m = MONTH_MAP.get(m, m)
-        try:
-            return pd.to_datetime(f"{d} {m} {y}", dayfirst=True).strftime("%Y-%m-%d")
-        except Exception:
-            return s
-    return s
-
-def main(inp: str, outp: str):
-    df = pd.read_excel(inp)
-    out = pd.DataFrame({
-        "ticker": df["Kode"].astype(str).str.upper().str.strip(),
-        "symbol_yf": df["Kode"].astype(str).str.upper().str.strip() + ".JK",
-        "company_name": df["Nama Perusahaan"].astype(str).str.strip(),
-        "listing_date": df["Tanggal Pencatatan"].apply(parse_id_date),
-        "shares_outstanding": df["Saham"].astype(str).str.replace(".", "", regex=False).str.replace(",", "", regex=False),
-        "board": df["Papan Pencatatan"].astype(str).str.strip(),
-        "status": "active",
-        "sector": "",
-    })
-    out = out.drop_duplicates(subset=["ticker"]).reset_index(drop=True)
-    out.to_csv(outp, index=False)
-    print(f"saved {len(out)} tickers -> {outp}")
-
-if __name__ == "__main__":
+def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--input", required=True)
-    ap.add_argument("--output", required=True)
-    a = ap.parse_args()
-    main(a.input, a.output)
+    ap.add_argument('--input', required=True)
+    ap.add_argument('--output', required=True)
+    args = ap.parse_args()
+
+    df = pd.read_excel(args.input)
+    cols = {str(c).strip().lower(): c for c in df.columns}
+    out = pd.DataFrame()
+    out['ticker'] = df[cols['kode']].astype(str).str.upper().str.strip()
+    out['symbol_yf'] = out['ticker'] + '.JK'
+    out['company_name'] = df[cols.get('nama perusahaan', cols.get('nama emiten'))].astype(str)
+    out['listing_date'] = pd.to_datetime(df[cols.get('tanggal pencatatan')], errors='coerce').dt.date.astype(str)
+    saham_col = cols.get('saham')
+    if saham_col:
+        out['shares_outstanding'] = pd.to_numeric(df[saham_col].astype(str).str.replace('.', '', regex=False).str.replace(',', '', regex=False), errors='coerce')
+    else:
+        out['shares_outstanding'] = pd.NA
+    out['board'] = df[cols.get('papan pencatatan', '')].astype(str) if cols.get('papan pencatatan') else ''
+    out['status'] = out['board'].map(lambda x: 'special_monitoring' if 'khusus' in str(x).lower() else 'active')
+    out['sector'] = ''
+    out = out.drop_duplicates(subset=['ticker']).sort_values('ticker').reset_index(drop=True)
+    Path(args.output).parent.mkdir(parents=True, exist_ok=True)
+    out.to_csv(args.output, index=False)
+    print(f'wrote {len(out)} rows to {args.output}')
+
+if __name__ == '__main__':
+    main()
