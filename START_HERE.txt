@@ -1,4 +1,0 @@
-1) pip install -r requirements.txt
-2) (opsional tapi direkomendasikan) build universe penuh:
-   python scripts/build_idx_universe_all.py --output data/idx_universe_full.csv
-3) streamlit run streamlit_app.py

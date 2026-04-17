@@ -1,587 +1,449 @@
 
 from __future__ import annotations
-
-from datetime import date, timedelta
+import math
 from pathlib import Path
+from typing import List, Dict, Tuple
 
+import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
+import yfinance as yf
 
-from src.cache_utils import (
-    filter_cached_prices_for_universe,
-    merge_cached_and_new_prices,
-    persist_run_outputs,
-    read_cached_prices,
-    read_last_run,
-)
-from src.data_audit import audit_broker_summary, audit_done_detail, audit_orderbook, audit_prices, merge_audits
-from src.fetch_prices import fetch_yf_prices_batched, retry_failed_tickers
-from src.scoring import compute_ticker_features
-from src.universe import resolve_universe_source
-from src.route_overlay import derive_route_state, build_route_overlay
-from src.normalizers import normalize_uploaded_csv
-from src.validation import build_price_side_validation_panel, run_walk_forward_validation
-from src.macro_filter import annotate_macro_filter, apply_macro_bucket_override
+st.set_page_config(page_title="IDX Front-Run Board", page_icon="📈", layout="wide")
 
-st.set_page_config(page_title="IDX Scanner V5.0", layout="wide")
-BASE_DIR = Path(__file__).resolve().parent
+ROOT = Path(__file__).resolve().parent
+DATA_DIR = ROOT / "data"
+UNIVERSE_PATH = DATA_DIR / "idx_universe_full.csv"
 
-BUCKET_ORDER = [
-    "SIAP NAIK SEKARANG",
-    "HAMPIR SIAP — TUNGGU TRIGGER",
-    "SUDAH NAIK — TUNGGU PULLBACK / SIGNAL BERIKUTNYA",
-    "WATCH REBOUND",
-    "JANGAN SENTUH DULU",
-    "AVOID / BUANG",
-]
-BUCKET_HELP = {
-    "SIAP NAIK SEKARANG": "Setup sudah paling rapi. Fokus kandidat entry terdekat.",
-    "HAMPIR SIAP — TUNGGU TRIGGER": "Belum masuk sekarang. Tunggu trigger yang jelas.",
-    "SUDAH NAIK — TUNGGU PULLBACK / SIGNAL BERIKUTNYA": "Arah masih oke, tapi entry sekarang rawan telat.",
-    "WATCH REBOUND": "Pantulan taktis, bukan trend sehat utama.",
-    "JANGAN SENTUH DULU": "Belum ada edge jelas. Simpan di radar saja.",
-    "AVOID / BUANG": "Risiko distribusi / breakdown lebih dominan.",
-}
-
-
-def load_csv(upload, kind: str) -> pd.DataFrame:
-    if upload is None:
-        return pd.DataFrame()
+def safe_float(x, default=np.nan):
     try:
-        raw = pd.read_csv(upload)
-    except Exception as e:
-        st.error(f"Gagal baca {kind} CSV: {e}")
+        return float(x)
+    except Exception:
+        return default
+
+@st.cache_data(show_spinner=False)
+def load_universe() -> pd.DataFrame:
+    if not UNIVERSE_PATH.exists():
+        raise FileNotFoundError(f"Missing {UNIVERSE_PATH}")
+    df = pd.read_csv(UNIVERSE_PATH)
+    df.columns = [str(c).strip().lower() for c in df.columns]
+    if "ticker" not in df.columns:
+        raise ValueError("idx_universe_full.csv must contain column: ticker")
+    if "symbol_yf" not in df.columns:
+        df["symbol_yf"] = df["ticker"].astype(str).str.upper().str.strip() + ".JK"
+    for col in ["company_name", "sector", "board", "status", "listing_date"]:
+        if col not in df.columns:
+            df[col] = ""
+    df["ticker"] = df["ticker"].astype(str).str.upper().str.strip()
+    df["symbol_yf"] = df["symbol_yf"].astype(str).str.upper().str.strip()
+    df = df.drop_duplicates(subset=["ticker"]).reset_index(drop=True)
+    return df
+
+@st.cache_data(show_spinner=True, ttl=60 * 60)
+def fetch_prices(symbols: Tuple[str, ...], period: str = "18mo", interval: str = "1d", batch_size: int = 80) -> pd.DataFrame:
+    frames = []
+    for i in range(0, len(symbols), batch_size):
+        batch = list(symbols[i:i + batch_size])
+        try:
+            raw = yf.download(
+                tickers=batch,
+                period=period,
+                interval=interval,
+                auto_adjust=False,
+                progress=False,
+                group_by="ticker",
+                threads=True,
+            )
+        except Exception:
+            continue
+        if raw is None or raw.empty:
+            continue
+        if isinstance(raw.columns, pd.MultiIndex):
+            for sym in batch:
+                if sym not in raw.columns.get_level_values(0):
+                    continue
+                try:
+                    sub = raw[sym].copy()
+                except Exception:
+                    continue
+                if sub.empty:
+                    continue
+                sub = sub.rename(columns={c: str(c).lower() for c in sub.columns})
+                sub["symbol_yf"] = sym
+                sub["date"] = sub.index
+                frames.append(sub.reset_index(drop=True))
+        else:
+            sub = raw.copy()
+            sub = sub.rename(columns={c: str(c).lower() for c in sub.columns})
+            sub["symbol_yf"] = batch[0]
+            sub["date"] = sub.index
+            frames.append(sub.reset_index(drop=True))
+    if not frames:
         return pd.DataFrame()
-    try:
-        return normalize_uploaded_csv(raw, kind)
-    except Exception as e:
-        st.warning(f"Normalisasi {kind} gagal, pakai raw CSV. Detail: {e}")
-        return raw
+    out = pd.concat(frames, ignore_index=True)
+    for c in ["open", "high", "low", "close", "adj close", "volume"]:
+        if c in out.columns:
+            out[c] = pd.to_numeric(out[c], errors="coerce")
+    return out
 
+def last_valid(s: pd.Series) -> float:
+    s = pd.to_numeric(s, errors="coerce").dropna()
+    return float(s.iloc[-1]) if len(s) else np.nan
 
-@st.cache_data(show_spinner=False, ttl=3600)
-def cached_load_universe(mode: str, uploaded_universe: pd.DataFrame | None):
-    return resolve_universe_source(mode=mode, base_dir=BASE_DIR, uploaded_df=uploaded_universe)
+def compute_symbol_features(df_symbol: pd.DataFrame, bench_20: float, bench_60: float, market_bias: float) -> Dict:
+    s = df_symbol.sort_values("date").copy()
+    if len(s) < 80:
+        return {}
+    close = pd.to_numeric(s["close"], errors="coerce")
+    high = pd.to_numeric(s["high"], errors="coerce")
+    low = pd.to_numeric(s["low"], errors="coerce")
+    vol = pd.to_numeric(s.get("volume", 0), errors="coerce").fillna(0)
 
+    s["ema20"] = close.ewm(span=20, adjust=False).mean()
+    s["ema50"] = close.ewm(span=50, adjust=False).mean()
+    s["ema200"] = close.ewm(span=200, adjust=False).mean()
+    tr = pd.concat([(high - low), (high - close.shift()).abs(), (low - close.shift()).abs()], axis=1).max(axis=1)
+    s["atr14"] = tr.rolling(14).mean()
+    s["vol20"] = vol.rolling(20).mean()
+    s["high60"] = high.rolling(60).max()
+    s["low20"] = low.rolling(20).min()
+    s["low60"] = low.rolling(60).min()
 
-@st.cache_data(show_spinner=False, ttl=1800)
-def cached_fetch_prices(tickers: tuple[str, ...], start: str, batch_size: int, pause_s: float):
-    result = fetch_yf_prices_batched(list(tickers), start=start, batch_size=batch_size, pause_s=pause_s)
-    retry_reports = []
-    if result.failed_tickers:
-        retry_df = retry_failed_tickers(result.failed_tickers, start=start)
-        if not retry_df.empty:
-            merged = pd.concat([result.prices, retry_df], ignore_index=True)
-            merged = merged.drop_duplicates(["ticker", "date"], keep="last")
-            recovered = set(retry_df["ticker"].unique().tolist())
-            still_failed = [t for t in result.failed_tickers if t not in recovered]
-            retry_reports.append({
-                "batch_no": "retry_single",
-                "requested": len(result.failed_tickers),
-                "loaded": len(recovered),
-                "failed": len(still_failed),
-                "failed_preview": ", ".join(still_failed[:10]),
-                "error": None,
-            })
-            result.failed_tickers = still_failed
-            result.prices = merged
-    result.batch_reports.extend(retry_reports)
-    return result
+    c = float(close.iloc[-1])
+    ema20 = float(s["ema20"].iloc[-1])
+    ema50 = float(s["ema50"].iloc[-1])
+    ema200 = float(s["ema200"].iloc[-1]) if not math.isnan(float(s["ema200"].iloc[-1])) else ema50
+    atr14 = float(s["atr14"].iloc[-1]) if not math.isnan(float(s["atr14"].iloc[-1])) else 0.0
+    high60 = float(s["high60"].iloc[-1]) if not math.isnan(float(s["high60"].iloc[-1])) else c
+    low20 = float(s["low20"].iloc[-1]) if not math.isnan(float(s["low20"].iloc[-1])) else c
+    low60 = float(s["low60"].iloc[-1]) if not math.isnan(float(s["low60"].iloc[-1])) else c
+    vol_last = float(vol.iloc[-1])
+    vol20 = float(s["vol20"].iloc[-1]) if not math.isnan(float(s["vol20"].iloc[-1])) else vol_last
 
+    def ret(n):
+        if len(close) <= n:
+            return np.nan
+        prev = float(close.iloc[-1 - n])
+        if prev == 0 or math.isnan(prev):
+            return np.nan
+        return c / prev - 1
 
-def render_candles(price_df: pd.DataFrame, ticker: str):
-    g = price_df[price_df["ticker"] == ticker].copy().sort_values("date")
-    if g.empty:
-        st.info("No price history for selected ticker.")
+    ret5 = ret(5); ret20 = ret(20); ret60 = ret(60)
+    rs20 = safe_float(ret20) - safe_float(bench_20, 0)
+    rs60 = safe_float(ret60) - safe_float(bench_60, 0)
+
+    trend_ok = (c > ema20) + (ema20 > ema50) + (ema50 > ema200)
+    trend_score = trend_ok / 3.0
+    breakout_gap = (high60 - c) / max(c, 1e-9)
+    breakout_integrity = np.clip((c / max(high60, 1e-9)), 0, 1)
+    volume_expansion = vol_last / max(vol20, 1.0)
+    dry_proxy = np.clip(1 - (s["atr14"].iloc[-1] / max(c, 1e-9)) * 12, 0, 1) if c > 0 else 0.0
+    extension = max((c / max(ema20, 1e-9) - 1), 0)
+    pullback_ok = (c - ema20) / max(atr14, 1e-9) if atr14 > 0 else 0
+
+    opportunity_score = (
+        0.28 * trend_score
+        + 0.18 * np.clip(rs20 * 8 + 0.5, 0, 1)
+        + 0.15 * np.clip(rs60 * 5 + 0.5, 0, 1)
+        + 0.15 * np.clip(volume_expansion / 2.0, 0, 1)
+        + 0.14 * np.clip((1 - breakout_gap * 8), 0, 1)
+        + 0.10 * dry_proxy
+    )
+    front_run_score = (
+        0.24 * np.clip(rs20 * 8 + 0.45, 0, 1)
+        + 0.20 * np.clip(rs60 * 5 + 0.45, 0, 1)
+        + 0.20 * np.clip((1 - max(breakout_gap - 0.02, 0) * 8), 0, 1)
+        + 0.16 * dry_proxy
+        + 0.10 * np.clip(volume_expansion / 1.5, 0, 1)
+        + 0.10 * np.clip(market_bias + 0.5, 0, 1)
+    )
+    too_late_risk = np.clip(extension * 6 + max(safe_float(ret20, 0) - 0.18, 0) * 2, 0, 1)
+    false_breakout_risk = np.clip((1 - trend_score) * 0.4 + max(breakout_gap - 0.01, 0) * 6 + max(1 - volume_expansion, 0) * 0.15, 0, 1)
+
+    if opportunity_score >= 0.67 and too_late_risk < 0.5 and false_breakout_risk < 0.55:
+        board = "OPPORTUNITY SEKARANG"
+    elif front_run_score >= 0.58:
+        board = "FRONT-RUN MARKET"
+    else:
+        board = "HIDDEN"
+
+    if board == "OPPORTUNITY SEKARANG":
+        if breakout_gap <= 0.01 and too_late_risk < 0.35:
+            label = "PALING DEKAT ENTRY"
+        elif trend_score > 0.8 and false_breakout_risk < 0.35:
+            label = "STRUKTUR PALING BERSIH"
+        else:
+            label = "MASIH LAYAK BUY"
+    elif board == "FRONT-RUN MARKET":
+        if breakout_gap <= 0.03:
+            label = "HAMPIR TRIGGER"
+        elif rs20 > 0 and dry_proxy > 0.45:
+            label = "PALING EARLY"
+        else:
+            label = "NEXT WAVE"
+    else:
+        label = "BELUM FOKUS BUY"
+
+    why = []
+    if trend_score > 0.66:
+        why.append("trend sehat")
+    if rs20 > 0:
+        why.append("lebih kuat dari IHSG")
+    if volume_expansion > 1.15:
+        why.append("volume mulai masuk")
+    if dry_proxy > 0.5:
+        why.append("struktur relatif ringan")
+    if not why:
+        why.append("belum cukup jelas")
+    why_now = ", ".join(why[:3])
+
+    if board == "OPPORTUNITY SEKARANG":
+        trigger = f"tetap di atas {high60:,.0f} / lanjut kuat"
+    else:
+        trigger = f"break {high60:,.0f}"
+    invalid = f"close < {min(ema20, low20):,.0f}"
+    timing = "boleh dicicil" if board == "OPPORTUNITY SEKARANG" else "tunggu trigger"
+
+    confidence = np.clip(
+        0.35 * trend_score
+        + 0.20 * np.clip(volume_expansion / 2, 0, 1)
+        + 0.15 * np.clip(rs20 * 8 + 0.5, 0, 1)
+        + 0.15 * np.clip(market_bias + 0.5, 0, 1)
+        + 0.15 * (1 - false_breakout_risk),
+        0, 1
+    )
+
+    route = "risk-on" if market_bias > 0.15 else ("netral" if market_bias > -0.15 else "defensif")
+    catalyst = "butuh break resistance" if board == "FRONT-RUN MARKET" else "ikuti momentum"
+
+    return {
+        "close": c,
+        "ema20": ema20,
+        "ema50": ema50,
+        "ema200": ema200,
+        "high60": high60,
+        "low20": low20,
+        "low60": low60,
+        "atr14": atr14,
+        "ret5": ret5,
+        "ret20": ret20,
+        "ret60": ret60,
+        "rs20": rs20,
+        "rs60": rs60,
+        "trend_score": trend_score,
+        "volume_expansion": volume_expansion,
+        "dry_proxy": dry_proxy,
+        "opportunity_score": opportunity_score,
+        "front_run_score": front_run_score,
+        "too_late_risk": too_late_risk,
+        "false_breakout_risk": false_breakout_risk,
+        "board": board,
+        "status": label,
+        "why_now": why_now,
+        "trigger": trigger,
+        "invalidator": invalid,
+        "timing": timing,
+        "confidence": confidence,
+        "route": route,
+        "catalyst": catalyst,
+        "micro_note": "Belum dinilai (price only)",
+    }
+
+def build_market_context(price_df: pd.DataFrame) -> Dict:
+    jk = price_df[price_df["symbol_yf"] == "^JKSE"].copy()
+    if jk.empty:
+        return {"market_bias": 0.0, "market_regime": "tidak tersedia", "breadth": np.nan}
+    jk = jk.sort_values("date")
+    c = pd.to_numeric(jk["close"], errors="coerce")
+    ema50 = c.ewm(span=50, adjust=False).mean().iloc[-1]
+    ema200 = c.ewm(span=200, adjust=False).mean().iloc[-1]
+    ret20 = c.iloc[-1] / c.iloc[-21] - 1 if len(c) > 21 else 0.0
+    market_bias = 0.0
+    market_bias += 0.3 if c.iloc[-1] > ema50 else -0.2
+    market_bias += 0.3 if c.iloc[-1] > ema200 else -0.2
+    market_bias += np.clip(ret20 * 3, -0.3, 0.3)
+    market_regime = "risk-on" if market_bias > 0.25 else ("netral" if market_bias > -0.2 else "defensif")
+    return {"market_bias": float(np.clip(market_bias, -1, 1)), "market_regime": market_regime, "jkse_close": float(c.iloc[-1]), "jkse_ret20": float(ret20)}
+
+def run_scan(universe: pd.DataFrame, period: str, max_tickers: int, batch_size: int) -> Tuple[pd.DataFrame, Dict, pd.DataFrame]:
+    use = universe.copy()
+    if max_tickers > 0:
+        use = use.head(max_tickers).copy()
+    symbols = tuple(use["symbol_yf"].tolist() + ["^JKSE"])
+    px = fetch_prices(symbols=symbols, period=period, batch_size=batch_size)
+    if px.empty:
+        return pd.DataFrame(), {"master_count": len(universe), "loaded_count": 0, "failed_count": len(use), "coverage": 0.0}, pd.DataFrame()
+    price_by_symbol = {sym: g.sort_values("date").copy() for sym, g in px.groupby("symbol_yf")}
+    market = build_market_context(px)
+    bench20 = market.get("jkse_ret20", 0.0)
+    jk = price_by_symbol.get("^JKSE", pd.DataFrame())
+    bench60 = np.nan
+    if not jk.empty:
+        c = pd.to_numeric(jk["close"], errors="coerce")
+        if len(c) > 61:
+            bench60 = c.iloc[-1] / c.iloc[-61] - 1
+    rows = []
+    loaded = []
+    failed = []
+    for _, meta in use.iterrows():
+        sym = meta["symbol_yf"]
+        sub = price_by_symbol.get(sym)
+        if sub is None or len(sub) < 80:
+            failed.append(meta["ticker"])
+            continue
+        feat = compute_symbol_features(sub, bench20=bench20, bench_60=bench60, market_bias=market["market_bias"])
+        if not feat:
+            failed.append(meta["ticker"])
+            continue
+        row = meta.to_dict()
+        row.update(feat)
+        rows.append(row)
+        loaded.append(meta["ticker"])
+    scan = pd.DataFrame(rows)
+    audit = {
+        "master_count": int(len(universe)),
+        "target_count": int(len(use)),
+        "loaded_count": int(len(loaded)),
+        "failed_count": int(len(failed)),
+        "failed_sample": failed[:30],
+        "coverage": round(len(loaded) / max(len(use), 1), 4),
+        "market_regime": market.get("market_regime", "na"),
+        "market_bias": market.get("market_bias", 0.0),
+    }
+    return scan, audit, px
+
+def fmt_pct(x):
+    if pd.isna(x):
+        return "—"
+    return f"{x*100:+.1f}%"
+
+def fmt_num(x):
+    if pd.isna(x):
+        return "—"
+    return f"{x:,.0f}"
+
+def board_df(df: pd.DataFrame) -> pd.DataFrame:
+    if df.empty:
+        return df
+    out = df.copy()
+    out["Confidence"] = (out["confidence"] * 100).round(0).astype(int).astype(str) + "%"
+    out["Close"] = out["close"].map(fmt_num)
+    out["Route"] = out["route"].astype(str)
+    out["Ticker"] = out["ticker"]
+    out["Status"] = out["status"]
+    out["Alasan Singkat"] = out["why_now"]
+    out["Trigger"] = out["trigger"]
+    out["Invalidation"] = out["invalidator"]
+    out["Timing"] = out["timing"]
+    out["Catalyst"] = out["catalyst"]
+    out["Bid-Offer / Micro"] = out["micro_note"]
+    cols = ["Ticker", "Status", "Close", "Bid-Offer / Micro", "Alasan Singkat", "Trigger", "Invalidation", "Timing", "Confidence", "Route", "Catalyst"]
+    return out[cols]
+
+def draw_price_chart(px: pd.DataFrame, symbol: str):
+    sub = px[px["symbol_yf"] == symbol].copy().sort_values("date")
+    if sub.empty:
+        st.warning("Data harga tidak tersedia.")
         return
-    for span in [20, 50, 200]:
-        g[f"ema{span}"] = g["close"].ewm(span=span, adjust=False).mean()
+    sub["ema20"] = pd.to_numeric(sub["close"], errors="coerce").ewm(span=20, adjust=False).mean()
+    sub["ema50"] = pd.to_numeric(sub["close"], errors="coerce").ewm(span=50, adjust=False).mean()
     fig = go.Figure()
-    fig.add_trace(go.Candlestick(x=g["date"], open=g["open"], high=g["high"], low=g["low"], close=g["close"], name="Price"))
-    for span in [20, 50, 200]:
-        fig.add_trace(go.Scatter(x=g["date"], y=g[f"ema{span}"], name=f"EMA{span}"))
+    fig.add_trace(go.Candlestick(
+        x=sub["date"], open=sub["open"], high=sub["high"], low=sub["low"], close=sub["close"], name="Price"
+    ))
+    fig.add_trace(go.Scatter(x=sub["date"], y=sub["ema20"], mode="lines", name="EMA20"))
+    fig.add_trace(go.Scatter(x=sub["date"], y=sub["ema50"], mode="lines", name="EMA50"))
     fig.update_layout(height=520, xaxis_rangeslider_visible=False, margin=dict(l=10, r=10, t=30, b=10))
     st.plotly_chart(fig, use_container_width=True)
 
-
-def num(v, default=0.0) -> float:
-    try:
-        return float(pd.to_numeric(v, errors="coerce"))
-    except Exception:
-        return float(default)
-
-
-def txt(v, default="-") -> str:
-    if v is None:
-        return default
-    try:
-        if pd.isna(v):
-            return default
-    except Exception:
-        pass
-    s = str(v).strip()
-    return s if s else default
-
-
-def confidence_label(x: float) -> str:
-    if x >= 80:
-        return "tinggi"
-    if x >= 60:
-        return "sedang"
-    return "rendah"
-
-
-def micro_label(row: pd.Series, micro_available: bool) -> str:
-    if not micro_available:
-        return "Belum dinilai (price only)"
-    burst_bias = txt(row.get("burst_bias"), "NEUTRAL")
-    up = num(row.get("gulungan_up_score"))
-    down = num(row.get("gulungan_down_score"))
-    bull_trap = num(row.get("bull_trap_score"), 50)
-    bear_trap = num(row.get("bear_trap_score"), 50)
-    absorb_up = num(row.get("absorption_after_up_score"), 50)
-    absorb_down = num(row.get("absorption_after_down_score"), 50)
-    offer_q = num(row.get("offer_stack_quality"), 50)
-    bid_q = num(row.get("bid_stack_quality"), 50)
-    if burst_bias == "BULLISH" and up >= max(55, down) and bull_trap < 45 and absorb_up < 45 and offer_q >= 50:
-        return "Bagus & mendukung naik"
-    if burst_bias == "BULLISH" and bull_trap < 60:
-        return "Mulai membaik"
-    if burst_bias == "BEARISH" and down >= max(55, up) and bear_trap < 45 and absorb_down < 45 and bid_q < 50:
-        return "Jelek / tekanan jual"
-    return "Campuran / belum jelas"
-
-
-def classify_bucket(row: pd.Series, micro_available: bool) -> tuple[str, str]:
-    verdict = txt(row.get("verdict"), "NEUTRAL")
-    conf = num(row.get("score_confidence"))
-    trend = num(row.get("trend_quality"))
-    breakout = num(row.get("breakout_integrity"))
-    false_break = num(row.get("false_breakout_risk"))
-    dry = num(row.get("dry_score_final"), num(row.get("dry_score")))
-    wet = num(row.get("wet_score_final"), num(row.get("wet_score")))
-    route_fit = num(row.get("route_fit_score"), num(row.get("route_rank_score")))
-    rs20 = num(row.get("relative_strength_20d"))
-    risk_rank = num(row.get("risk_rank_score"))
-    long_rank = num(row.get("long_rank_score"))
-    burst_bias = txt(row.get("burst_bias"), "NEUTRAL")
-    bull_trap = num(row.get("bull_trap_score"), 50)
-    bear_trap = num(row.get("bear_trap_score"), 50)
-    absorb_up = num(row.get("absorption_after_up_score"), 50)
-
-    if verdict in {"AVOID", "TRIM"} or risk_rank >= 75 or wet - dry >= 20:
-        return "AVOID / BUANG", "Struktur/risiko masih jelek"
-    if verdict == "WATCH_REBOUND":
-        return "WATCH REBOUND", "Pantulan ada, tapi belum trend sehat utama"
-    if verdict == "READY_LONG":
-        if (rs20 > 0.08 and risk_rank >= 55) or false_break >= 45:
-            return "SUDAH NAIK — TUNGGU PULLBACK / SIGNAL BERIKUTNYA", "Arah masih oke tapi entry sekarang rawan telat"
-        if micro_available and burst_bias == "BULLISH" and bull_trap < 50 and absorb_up < 50:
-            return "SIAP NAIK SEKARANG", "Trigger + microstructure mendukung"
-        return "SIAP NAIK SEKARANG", "Setup sudah paling rapi sekarang"
-    if verdict == "WATCH":
-        if breakout >= 45 or route_fit >= 55 or long_rank >= 55:
-            return "HAMPIR SIAP — TUNGGU TRIGGER", "Setup bagus tapi trigger belum lengkap"
-        return "JANGAN SENTUH DULU", "Masih watchlist, belum ada edge kuat"
-    if verdict == "NEUTRAL":
-        if trend >= 60 and dry >= wet and (rs20 > 0.06 or long_rank >= 60):
-            return "SUDAH NAIK — TUNGGU PULLBACK / SIGNAL BERIKUTNYA", "Arah cukup sehat tapi tunggu entry lebih rapi"
-        if breakout >= 40 or route_fit >= 50:
-            return "HAMPIR SIAP — TUNGGU TRIGGER", "Sudah mendekat ke trigger"
-        return "JANGAN SENTUH DULU", "Belum ada alasan kuat buat masuk"
-    if verdict == "ILLIQUID":
-        return "AVOID / BUANG", "Likuiditas terlalu tipis"
-    if micro_available and burst_bias == "BEARISH" and bear_trap < 50:
-        return "AVOID / BUANG", "Tekanan jual masih dominan"
-    if conf < 45:
-        return "JANGAN SENTUH DULU", "Confidence terlalu rendah"
-    return "JANGAN SENTUH DULU", "Belum cukup jelas"
-
-
-def timing_text(bucket: str) -> str:
-    return {
-        "SIAP NAIK SEKARANG": "Boleh cicil / entry sekarang",
-        "HAMPIR SIAP — TUNGGU TRIGGER": "Tunggu break / reclaim",
-        "SUDAH NAIK — TUNGGU PULLBACK / SIGNAL BERIKUTNYA": "Tunggu pullback / retest",
-        "WATCH REBOUND": "Taktikal saja, jangan agresif",
-        "JANGAN SENTUH DULU": "Simpan di radar",
-        "AVOID / BUANG": "Hindari dulu",
-    }.get(bucket, "-")
-
-
-def build_simple_table(scan_df: pd.DataFrame, audit: dict | None, macro_hard_filter: bool = True, macro_strictness: str = "balanced") -> pd.DataFrame:
-    if scan_df.empty:
-        return scan_df
-    micro_available = bool((audit or {}).get("done_rows", 0) > 0 or (audit or {}).get("orderbook_rows", 0) > 0)
-    out = scan_df.copy()
-    if macro_hard_filter:
-        out = annotate_macro_filter(out, strictness=macro_strictness)
-    statuses = out.apply(lambda r: classify_bucket(r, micro_available), axis=1)
-    base_bucket = [s[0] for s in statuses]
-    base_reason = [s[1] for s in statuses]
-    if macro_hard_filter:
-        adjusted = [apply_macro_bucket_override(r, b, strictness=macro_strictness) for (_, r), b in zip(out.iterrows(), base_bucket)]
-        out["status_awam"] = [x[0] for x in adjusted]
-        out["alasan_singkat"] = [f"{reason} | {extra}" if extra else reason for reason, (_, extra) in zip(base_reason, adjusted)]
-    else:
-        out["status_awam"] = base_bucket
-        out["alasan_singkat"] = base_reason
-    out["timing"] = out["status_awam"].map(timing_text)
-    out["bid_offer_state"] = out.apply(lambda r: micro_label(r, micro_available), axis=1)
-    out["confidence_text"] = out.get("score_confidence", 0).apply(lambda x: confidence_label(num(x)))
-    out["trigger_singkat"] = out.get("trigger", "-").astype(str).str.slice(0, 120)
-    out["invalidator_singkat"] = out.get("invalidator", "-").astype(str).str.slice(0, 120)
-    out["why_now_short"] = out.get("why_now", "-").astype(str).str.slice(0, 120)
-    out["entry_score"] = (
-        pd.to_numeric(out.get("long_rank_score", 0), errors="coerce").fillna(0.0) * 0.45
-        + pd.to_numeric(out.get("route_rank_score", 0), errors="coerce").fillna(0.0) * 0.25
-        + pd.to_numeric(out.get("score_confidence", 0), errors="coerce").fillna(0.0) * 0.20
-        - pd.to_numeric(out.get("risk_rank_score", 0), errors="coerce").fillna(0.0) * 0.15
-    ).round(2)
-    if macro_hard_filter and "entry_score_macro" in out.columns:
-        out["entry_score"] = pd.to_numeric(out["entry_score_macro"], errors="coerce").fillna(out["entry_score"])
-    order = {name: i for i, name in enumerate(BUCKET_ORDER)}
-    out["bucket_order"] = out["status_awam"].map(order).fillna(999)
-    out = out.sort_values(["bucket_order", "entry_score", "score_confidence"], ascending=[True, False, False]).reset_index(drop=True)
-    return out
-
-
-st.title("IDX Scanner V5.0 — Action View")
-st.caption("Versi yang lebih gampang dibaca: fokus ke action bucket, trigger, invalidator, dan timing. Kolom debug dipindah ke advanced view.")
-last_run = read_last_run(BASE_DIR)
-if last_run:
-    st.caption(f"Last persisted run UTC: {last_run}")
+st.title("IDX Buy-Side Front-Run Board")
+st.caption("Full universe dari file IDX upload • price data via yfinance .JK • fokus buy-side only")
 
 with st.sidebar:
-    st.subheader("Universe")
-    universe_mode = st.radio(
-        "Universe mode",
-        options=["full", "auto", "sample"],
-        format_func=lambda x: {"full": "Full IHSG (local CSV first)", "auto": "Auto web fallback", "sample": "Sample only"}[x],
-        index=0,
-    )
-    uploaded_universe = st.file_uploader("Optional universe CSV / metadata CSV", type=["csv"], key="universe")
+    st.header("Scan Settings")
+    period = st.selectbox("History", ["12mo", "18mo", "24mo", "36mo"], index=1)
+    max_tickers = st.number_input("Max tickers (0 = all)", min_value=0, value=0, step=50)
+    batch_size = st.slider("Batch size yfinance", 20, 120, 80, 10)
+    run = st.button("Run scan", type="primary", use_container_width=True)
 
-    st.subheader("Prices")
-    history_months = st.slider("History (months)", min_value=6, max_value=36, value=12, step=3)
-    batch_size = st.slider("yfinance batch size", min_value=10, max_value=120, value=80, step=10)
-    batch_pause_s = st.slider("Pause between batches (s)", min_value=0.0, max_value=2.0, value=0.0, step=0.1)
-    max_tickers = st.number_input("Max tickers (0 = all)", min_value=0, max_value=2500, value=0, step=50)
-    use_cached_prices = st.checkbox("Use cached prices if available", value=True)
-    refresh_mode = st.radio("Refresh mode", options=["full_refresh", "cache_then_fill"], index=1)
+try:
+    universe = load_universe()
+except Exception as e:
+    st.error(f"Gagal load universe: {e}")
+    st.stop()
 
-    st.subheader("Macro Hard Filter")
-    macro_hard_filter = st.checkbox("Aktifkan hard filter macro/route", value=True)
-    macro_strictness = st.radio("Strictness", options=["loose", "balanced", "strict"], index=1, horizontal=True)
+st.info(f"Master universe siap pakai: **{len(universe):,} ticker**. File sumber: `data/idx_universe_full.csv`")
 
-    st.subheader("Optional real data")
-    broker_upload = st.file_uploader("Broker summary CSV", type=["csv"], key="broker")
-    broker_master_upload = st.file_uploader("Broker master CSV (optional)", type=["csv"], key="broker_master")
-    done_upload = st.file_uploader("Done detail CSV", type=["csv"], key="done")
-    orderbook_upload = st.file_uploader("Orderbook CSV", type=["csv"], key="orderbook")
-    route_events_upload = st.file_uploader("Route / catalyst events CSV (optional)", type=["csv"], key="route_events")
+if "scan_df" not in st.session_state:
+    st.session_state["scan_df"] = pd.DataFrame()
+    st.session_state["audit"] = {}
+    st.session_state["px"] = pd.DataFrame()
 
-    st.subheader("Run")
-    run_scan = st.button("Run scanner", type="primary")
-    run_validation = st.button("Run validation")
+if run:
+    with st.spinner("Sedang scan full universe..."):
+        scan_df, audit, px = run_scan(universe, period=period, max_tickers=max_tickers, batch_size=batch_size)
+        st.session_state["scan_df"] = scan_df
+        st.session_state["audit"] = audit
+        st.session_state["px"] = px
 
-uploaded_universe_df = load_csv(uploaded_universe, "universe") if uploaded_universe else pd.DataFrame()
-broker_df = load_csv(broker_upload, "broker")
-broker_master_df = load_csv(broker_master_upload, "broker_master")
-done_df = load_csv(done_upload, "done_detail")
-book_df = load_csv(orderbook_upload, "orderbook")
-route_events_df = load_csv(route_events_upload, "route_events")
+scan_df = st.session_state["scan_df"]
+audit = st.session_state["audit"]
+px = st.session_state["px"]
 
-if run_scan:
-    with st.spinner("Resolving universe..."):
-        universe_df, universe_source, universe_warnings = cached_load_universe(
-            universe_mode, uploaded_universe_df if not uploaded_universe_df.empty else None
-        )
-    if max_tickers and max_tickers > 0:
-        universe_df = universe_df.head(int(max_tickers)).copy()
-    tickers = universe_df["ticker"].astype(str).tolist()
-    start = str(date.today() - timedelta(days=int(history_months * 31)))
+if audit:
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Target ticker", f'{audit.get("target_count", 0):,}')
+    c2.metric("Loaded", f'{audit.get("loaded_count", 0):,}')
+    c3.metric("Failed", f'{audit.get("failed_count", 0):,}')
+    c4.metric("Coverage", f'{audit.get("coverage", 0)*100:.1f}%')
 
-    cached_prices = read_cached_prices(BASE_DIR) if use_cached_prices else pd.DataFrame()
-    cached_prices = filter_cached_prices_for_universe(cached_prices, tickers, min_start=start)
-    price_df = pd.DataFrame()
-    fetch_result = None
+    b1, b2 = st.columns(2)
+    b1.info(f"Market regime: **{audit.get('market_regime', 'na')}**")
+    b2.info(f"Market bias: **{audit.get('market_bias', 0):+.2f}**")
 
-    with st.spinner(f"Fetching EOD prices for {len(tickers)} tickers..."):
-        if refresh_mode == "cache_then_fill" and not cached_prices.empty:
-            have_tickers = set(cached_prices["ticker"].astype(str).unique().tolist())
-            missing_tickers = [t for t in tickers if t not in have_tickers]
-            if missing_tickers:
-                fetch_result = cached_fetch_prices(tuple(missing_tickers), start=start, batch_size=batch_size, pause_s=batch_pause_s)
-                price_df = merge_cached_and_new_prices(cached_prices, fetch_result.prices)
-            else:
-                price_df = cached_prices.copy()
-                class Dummy:
-                    prices = price_df
-                    failed_tickers = []
-                    attempted_tickers = tickers
-                    batch_reports = [{"batch_no": "cache_only", "requested": len(tickers), "loaded": len(tickers), "failed": 0, "failed_preview": "", "error": None}]
-                fetch_result = Dummy()
-        else:
-            fetch_result = cached_fetch_prices(tuple(tickers), start=start, batch_size=batch_size, pause_s=batch_pause_s)
-            price_df = merge_cached_and_new_prices(cached_prices, fetch_result.prices) if use_cached_prices else fetch_result.prices.copy()
+    if audit.get("failed_count", 0) > 0:
+        st.warning("Sebagian ticker gagal di-load dari yfinance. Ini normal kalau scan universe besar. Cek Data Audit di bawah untuk sampel ticker gagal.")
 
-    scan_df = compute_ticker_features(price_df, broker_df=broker_df, done_df=done_df, orderbook_df=book_df, metadata_df=universe_df, broker_master_df=broker_master_df)
-    if not scan_df.empty:
-        bias_series = pd.to_numeric(scan_df.get("market_bias_score", pd.Series(dtype=float)), errors="coerce") if "market_bias_score" in scan_df.columns else pd.Series(dtype=float)
-        market_bias = float(bias_series.median()) if not bias_series.empty else 50.0
-        regime = str(scan_df["market_regime"].mode().iloc[0]) if "market_regime" in scan_df.columns and not scan_df["market_regime"].dropna().empty else "CHOPPY"
-        exec_mode = str(scan_df["execution_mode"].mode().iloc[0]) if "execution_mode" in scan_df.columns and not scan_df["execution_mode"].dropna().empty else "SELECTIVE"
-        mh_count = int((scan_df.get("burst_bias", pd.Series(dtype=object)).astype(str).eq("BULLISH")).sum()) if "burst_bias" in scan_df.columns else 0
-        catalyst_score = 0.0
-        analog_label = "unknown"
-        scenario_family = "unknown"
-        if not route_events_df.empty:
-            if "catalyst_score" in route_events_df.columns:
-                catalyst_score = float(pd.to_numeric(route_events_df["catalyst_score"], errors="coerce").fillna(0).max())
-            if "analog_label" in route_events_df.columns and route_events_df["analog_label"].notna().any():
-                analog_label = str(route_events_df["analog_label"].dropna().iloc[0])
-            if "scenario_family" in route_events_df.columns and route_events_df["scenario_family"].notna().any():
-                scenario_family = str(route_events_df["scenario_family"].dropna().iloc[0])
-        route_state = derive_route_state(market_regime=regime, execution_mode=exec_mode, market_bias_score=market_bias, most_hated_clear_count=mh_count, catalyst_window_score=catalyst_score, analog_label=analog_label, scenario_family=scenario_family)
-        scan_df = build_route_overlay(scan_df, route_state, route_events_df if not route_events_df.empty else None)
-        if "route_fit_score" in scan_df.columns:
-            rel = pd.to_numeric(scan_df.get("relative_strength_20d", 0), errors="coerce").fillna(0.0)
-            conf = pd.to_numeric(scan_df.get("score_confidence", 0), errors="coerce").fillna(0.0)
-            catalyst = pd.to_numeric(scan_df.get("catalyst_window_score", 0), errors="coerce").fillna(0.0) * 100.0
-            scan_df["route_rank_score"] = (scan_df["route_fit_score"].fillna(0.0) * 55.0 + conf * 0.25 + catalyst * 0.10 + rel.clip(-0.10, 0.10) * 100.0).round(2)
-    audit = merge_audits(
-        audit_prices(price_df, attempted_tickers=len(fetch_result.attempted_tickers), failed_tickers=fetch_result.failed_tickers, batch_reports=fetch_result.batch_reports),
-        audit_broker_summary(broker_df),
-        audit_done_detail(done_df),
-        audit_orderbook(book_df),
-        universe_source,
-        universe_warnings,
-    )
-    audit["cache_mode"] = refresh_mode
-    audit["cache_prices_rows"] = int(len(cached_prices)) if use_cached_prices else 0
-    persist_info = persist_run_outputs(BASE_DIR, price_df, scan_df, audit)
-    audit["persist_info"] = persist_info
-    st.session_state["price_df"] = price_df
-    st.session_state["scan_df"] = scan_df
-    st.session_state["audit"] = audit
-    st.session_state["universe_df"] = universe_df
-    st.session_state["simple_df"] = build_simple_table(scan_df, audit, macro_hard_filter=macro_hard_filter, macro_strictness=macro_strictness)
-    st.session_state["macro_hard_filter"] = macro_hard_filter
-    st.session_state["macro_strictness"] = macro_strictness
+if scan_df.empty:
+    st.warning("Belum ada hasil scan. Klik **Run scan** dulu.")
+    st.stop()
 
-price_df = st.session_state.get("price_df", pd.DataFrame())
-scan_df = st.session_state.get("scan_df", pd.DataFrame())
-audit = st.session_state.get("audit", None)
-universe_df = st.session_state.get("universe_df", pd.DataFrame())
-simple_df = st.session_state.get("simple_df", pd.DataFrame())
-macro_hard_filter = st.session_state.get("macro_hard_filter", True)
-macro_strictness = st.session_state.get("macro_strictness", "balanced")
-validation_result = st.session_state.get("validation_result", None)
-validation_panel = st.session_state.get("validation_panel", pd.DataFrame())
+opp = scan_df[scan_df["board"] == "OPPORTUNITY SEKARANG"].copy().sort_values(["opportunity_score", "confidence"], ascending=False)
+fr = scan_df[scan_df["board"] == "FRONT-RUN MARKET"].copy().sort_values(["front_run_score", "confidence"], ascending=False)
 
-if run_validation:
-    if price_df.empty:
-        st.warning("Run scanner dulu supaya price history ada.")
-    else:
-        with st.spinner("Building validation panel..."):
-            panel = build_price_side_validation_panel(price_df, min_history=80, horizon=20)
-            if panel.empty:
-                st.warning("Validation panel kosong. Data belum cukup panjang untuk walk-forward.")
-            else:
-                score_col = "long_rank_score" if (isinstance(scan_df, pd.DataFrame) and "long_rank_score" in scan_df.columns) else None
-                if score_col is None:
-                    st.warning("long_rank_score belum tersedia.")
-                else:
-                    val = run_walk_forward_validation(panel, score_col=score_col, label_col="label_long_success", return_col="fwd_return", date_col="date", train_days=252*2, test_days=63, top_n=20)
-                    st.session_state["validation_panel"] = panel
-                    st.session_state["validation_result"] = val
-                    validation_result = val
-                    validation_panel = panel
-
-if audit is not None:
-    micro_live = audit.get("done_rows", 0) > 0 or audit.get("orderbook_rows", 0) > 0
-    cols = st.columns(8)
-    cols[0].metric("Tickers scanned", audit.get("ticker_count_loaded", 0))
-    cols[1].metric("Ready sekarang", int((simple_df["status_awam"] == "SIAP NAIK SEKARANG").sum()) if isinstance(simple_df, pd.DataFrame) and not simple_df.empty else 0)
-    cols[2].metric("Hampir siap", int((simple_df["status_awam"] == "HAMPIR SIAP — TUNGGU TRIGGER").sum()) if isinstance(simple_df, pd.DataFrame) and not simple_df.empty else 0)
-    cols[3].metric("Tunggu pullback", int((simple_df["status_awam"] == "SUDAH NAIK — TUNGGU PULLBACK / SIGNAL BERIKUTNYA").sum()) if isinstance(simple_df, pd.DataFrame) and not simple_df.empty else 0)
-    cols[4].metric("Watch rebound", int((simple_df["status_awam"] == "WATCH REBOUND").sum()) if isinstance(simple_df, pd.DataFrame) and not simple_df.empty else 0)
-    cols[5].metric("Avoid / buang", int((simple_df["status_awam"] == "AVOID / BUANG").sum()) if isinstance(simple_df, pd.DataFrame) and not simple_df.empty else 0)
-    cols[6].metric("Source mode", audit.get("source_mode", "n/a"))
-    cols[7].metric("Bid-offer", "AKTIF" if micro_live else "BELUM AKTIF")
-    if isinstance(simple_df, pd.DataFrame) and not simple_df.empty and "route_summary" in simple_df.columns:
-        top_route = str(simple_df["route_summary"].mode().iloc[0])
-        st.caption("Macro route aktif: %s | Hard filter: %s (%s)" % (top_route, "ON" if macro_hard_filter else "OFF", macro_strictness))
-    if audit.get("stale_warning"):
-        st.warning(audit["stale_warning"])
-    for w in audit.get("universe_warnings", []) or []:
-        st.warning(w)
-    if audit.get("universe_source") == "fallback_sample":
-        st.error("Universe masih sample fallback. Jadi hasil belum full IHSG.")
-    if not micro_live:
-        st.info("Run ini masih REAL_PRICES_ONLY. Jadi pengelompokan 'bid-offer bagus' belum boleh dianggap final. Yang sekarang jujurly baru grouping readiness price-side.")
-
-view = st.radio("View", ["Action View", "Ticker Detail", "Advanced Table", "Validation", "Data Audit"], horizontal=True)
-
-if view == "Action View":
-    st.subheader("Action View — gampang dibaca")
-    if simple_df.empty:
-        st.info("Belum ada hasil scan. Klik Run scanner.")
-    else:
-        use_bid_offer = st.checkbox("Urutkan utamakan bid-offer / microstructure (kalau data ada)", value=False)
-        work = simple_df.copy()
-        if use_bid_offer and audit and (audit.get("done_rows", 0) > 0 or audit.get("orderbook_rows", 0) > 0):
-            work = work.sort_values(["status_awam", "bid_offer_state", "entry_score", "score_confidence"], ascending=[True, True, False, False])
-        macro_focus = st.selectbox("Fokus macro state", options=["Semua", "ALIGNED", "NEXT_ROUTE", "CAUTION", "OFFSIDE"], index=0)
-        top_bucket = st.selectbox("Fokus bucket", options=["Semua"] + BUCKET_ORDER, index=0)
-        if macro_focus != "Semua" and "macro_filter_state" in work.columns:
-            work = work[work["macro_filter_state"] == macro_focus].copy()
-        if top_bucket != "Semua":
-            work = work[work["status_awam"] == top_bucket].copy()
-        for bucket in BUCKET_ORDER:
-            bucket_df = work[work["status_awam"] == bucket].copy()
-            if bucket_df.empty:
-                continue
-            st.markdown(f"### {bucket}")
-            st.caption(BUCKET_HELP[bucket])
-            cols = [
-                "ticker", "sector", "close", "status_awam", "bid_offer_state", "alasan_singkat", "trigger_singkat",
-                "invalidator_singkat", "timing", "confidence_text", "route_primary", "top_catalyst_title", "macro_filter_state"
-            ]
-            cols = [c for c in cols if c in bucket_df.columns]
-            rename_map = {
-                "ticker": "Ticker",
-                "sector": "Sector",
-                "close": "Close",
-                "status_awam": "Status",
-                "bid_offer_state": "Bid-Offer / Micro",
-                "alasan_singkat": "Alasan Singkat",
-                "trigger_singkat": "Trigger",
-                "invalidator_singkat": "Invalidation",
-                "timing": "Timing",
-                "confidence_text": "Confidence",
-                "route_primary": "Route",
-                "top_catalyst_title": "Catalyst",
-                "macro_filter_state": "Macro State",
-            }
-            show_df = bucket_df[cols].rename(columns=rename_map)
-            st.dataframe(show_df, use_container_width=True, hide_index=True)
-        with st.expander("Lihat advanced table"):
-            adv_cols = [c for c in [
-                "ticker","verdict","score_confidence","phase","trend_quality","breakout_integrity","false_breakout_risk",
-                "dry_score_final","wet_score_final","broker_alignment_score","broker_mode","dominant_accumulator",
-                "dominant_distributor","institutional_support","institutional_resistance","latest_event_label",
-                "long_rank_score","risk_rank_score","route_rank_score","why_now","why_not_yet"
-            ] if c in work.columns]
-            st.dataframe(work[adv_cols], use_container_width=True, hide_index=True)
-        st.download_button("Download action table CSV", data=work.to_csv(index=False).encode("utf-8"), file_name="idx_action_view.csv", mime="text/csv")
-
-elif view == "Ticker Detail":
-    st.subheader("Ticker Detail")
-    if simple_df.empty:
-        st.info("Belum ada hasil scan.")
-    else:
-        picker_df = simple_df[["ticker", "status_awam"]].copy()
-        picker_df["label"] = picker_df["ticker"] + " — " + picker_df["status_awam"]
-        selected = st.selectbox("Ticker", options=picker_df["label"].tolist())
-        ticker = selected.split(" — ")[0]
-        row = simple_df.loc[simple_df["ticker"] == ticker].iloc[0]
-        c1, c2, c3, c4, c5, c6 = st.columns(6)
-        c1.metric("Status", row["status_awam"])
-        c2.metric("Timing", row.get("timing", "-"))
-        c3.metric("Confidence", row.get("confidence_text", "-"))
-        c4.metric("Bid-Offer / Micro", row.get("bid_offer_state", "-"))
-        c5.metric("Route", row.get("route_primary", "-"))
-        c6.metric("Catalyst", txt(row.get("top_catalyst_title"), "-"))
-        render_candles(price_df, ticker)
-        st.markdown(f"**Alasan singkat:** {row.get('alasan_singkat', '-')}")
-        st.markdown(f"**Why now:** {row.get('why_now', '-')}")
-        st.markdown(f"**Why not yet:** {row.get('why_not_yet', '-')}")
-        st.markdown(f"**Trigger:** {row.get('trigger', '-')}")
-        st.markdown(f"**Invalidation:** {row.get('invalidator', '-')}")
-        st.markdown(f"**Macro state:** {row.get('macro_filter_state', '-')} | **Macro note:** {row.get('macro_note', '-')}")
-        st.markdown(f"**Dominant risk:** {row.get('dominant_risk', '-')}")
-        extra_cols = [c for c in [
-            "trend_quality","breakout_integrity","false_breakout_risk","dry_score_final","wet_score_final",
-            "broker_alignment_score","broker_mode","dominant_accumulator","dominant_distributor",
-            "institutional_support","institutional_support_low","institutional_support_high",
-            "institutional_resistance","institutional_resistance_low","institutional_resistance_high",
-            "gulungan_up_score","gulungan_down_score","effort_result_up","effort_result_down",
-            "post_up_followthrough_score","post_down_followthrough_score","bull_trap_score","bear_trap_score",
-            "absorption_after_up_score","absorption_after_down_score","bid_stack_quality","offer_stack_quality",
-            "score_confidence","data_completeness_score","module_agreement_score","long_rank_score","risk_rank_score","route_rank_score"
-        ] if c in row.index]
-        st.dataframe(pd.DataFrame([row[extra_cols]]), use_container_width=True, hide_index=True)
-
-elif view == "Advanced Table":
-    st.subheader("Advanced Table")
-    if scan_df.empty:
-        st.info("Belum ada hasil scan.")
-    else:
-        cols = [c for c in [
-            "ticker","sector","verdict","status_awam","score_confidence","phase","market_regime","execution_mode",
-            "trend_quality","breakout_integrity","false_breakout_risk","dry_score_final","wet_score_final","drywet_state",
-            "broker_alignment_score","broker_persistence_score","broker_mode","dominant_accumulator","dominant_distributor",
-            "institutional_support","institutional_resistance","gulungan_up_score","gulungan_down_score","latest_event_label",
-            "relative_strength_20d","sector_relative_strength_20d","long_rank_score","risk_rank_score","route_rank_score",
-            "route_primary","route_bias","forward_radar_bucket","top_catalyst_title","macro_filter_state","macro_gate_score","macro_note","why_now","why_not_yet","trigger","invalidator","dominant_risk"
-        ] if c in simple_df.columns]
-        st.dataframe(simple_df[cols], use_container_width=True, hide_index=True)
-
-elif view == "Validation":
-    st.subheader("Walk-forward Validation")
-    st.caption("Scaffold kejujuran: buat cek apakah ranking kelihatan bagus atau memang lumayan konsisten.")
-    if validation_result is None:
-        st.info("Klik Run validation setelah scanner jalan.")
-    else:
-        if validation_result.summary:
-            m1, m2, m3 = st.columns(3)
-            auc = validation_result.summary.get("auc", float("nan"))
-            p20 = validation_result.summary.get("precision_at_20", float("nan"))
-            exp20 = validation_result.summary.get("expectancy_at_20", float("nan"))
-            m1.metric("Mean AUC", round(auc, 3) if pd.notna(auc) else "—")
-            m2.metric("Mean Precision@20", round(p20, 3) if pd.notna(p20) else "—")
-            m3.metric("Mean Expectancy@20", round(exp20, 4) if pd.notna(exp20) else "—")
-        if not validation_result.fold_metrics.empty:
-            st.markdown("### Fold metrics")
-            st.dataframe(validation_result.fold_metrics, use_container_width=True, hide_index=True)
-        if not validation_result.predictions.empty:
-            st.markdown("### Top validation predictions")
-            top_val = validation_result.predictions.sort_values(["fold", "long_rank_score"], ascending=[True, False]).groupby("fold").head(20)
-            st.dataframe(top_val, use_container_width=True, hide_index=True)
-        if isinstance(validation_panel, pd.DataFrame) and not validation_panel.empty:
-            st.download_button("Download validation panel CSV", data=validation_panel.to_csv(index=False).encode("utf-8"), file_name="idx_validation_panel.csv", mime="text/csv")
-
+st.subheader("OPPORTUNITY SEKARANG")
+if opp.empty:
+    st.info("Belum ada nama yang lolos bucket ini di run sekarang.")
 else:
-    st.subheader("Data Audit")
-    if audit is None:
-        st.info("Belum ada audit. Klik Run scanner.")
-    else:
-        left, right = st.columns(2)
-        with left:
-            st.markdown("### Coverage")
-            st.json({
-                "ticker_count_loaded": audit.get("ticker_count_loaded"),
-                "attempted_tickers": audit.get("attempted_tickers"),
-                "failed_ticker_count": audit.get("failed_ticker_count"),
-                "price_date_min": audit.get("price_date_min"),
-                "price_date_max": audit.get("price_date_max"),
-                "universe_source": audit.get("universe_source"),
-                "source_mode": audit.get("source_mode"),
-                "persisted": audit.get("persist_info", {}),
-                "cache_mode": audit.get("cache_mode"),
-                "cache_prices_rows": audit.get("cache_prices_rows"),
-            })
-        with right:
-            st.markdown("### Optional Data Hooks")
-            st.json({
-                "broker_rows": audit.get("broker_rows"),
-                "broker_count_loaded": audit.get("broker_count_loaded"),
-                "broker_columns_ok": audit.get("broker_columns_ok"),
-                "done_rows": audit.get("done_rows"),
-                "done_columns_ok": audit.get("done_columns_ok"),
-                "orderbook_rows": audit.get("orderbook_rows"),
-                "orderbook_columns_ok": audit.get("orderbook_columns_ok"),
-            })
+    st.dataframe(board_df(opp), use_container_width=True, hide_index=True)
+
+st.subheader("FRONT-RUN MARKET")
+if fr.empty:
+    st.info("Belum ada nama yang lolos bucket ini di run sekarang.")
+else:
+    st.dataframe(board_df(fr), use_container_width=True, hide_index=True)
+
+with st.expander("Ticker Detail", expanded=False):
+    pick = st.selectbox("Pilih ticker", scan_df["ticker"].tolist())
+    row = scan_df[scan_df["ticker"] == pick].iloc[0]
+    a, b, c = st.columns(3)
+    a.metric("Status", row["status"])
+    b.metric("Confidence", f'{row["confidence"]*100:.0f}%')
+    c.metric("Close", fmt_num(row["close"]))
+    st.write(f"**Alasan singkat:** {row['why_now']}")
+    st.write(f"**Trigger:** {row['trigger']}")
+    st.write(f"**Invalidation:** {row['invalidator']}")
+    st.write(f"**Timing:** {row['timing']}")
+    st.write(f"**Route:** {row['route']} | **Catalyst:** {row['catalyst']}")
+    draw_price_chart(px, row["symbol_yf"])
+
+with st.expander("Advanced Table", expanded=False):
+    adv = scan_df[[
+        "ticker","company_name","sector","board","close","ret5","ret20","ret60","rs20","rs60",
+        "trend_score","opportunity_score","front_run_score","too_late_risk","false_breakout_risk","status"
+    ]].copy()
+    st.dataframe(adv.sort_values(["opportunity_score", "front_run_score"], ascending=False), use_container_width=True, hide_index=True)
+
+with st.expander("Data Audit", expanded=False):
+    st.json(audit)
