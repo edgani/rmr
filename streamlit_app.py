@@ -91,7 +91,7 @@ def last_valid(s: pd.Series) -> float:
     s = pd.to_numeric(s, errors="coerce").dropna()
     return float(s.iloc[-1]) if len(s) else np.nan
 
-def compute_symbol_features(df_symbol: pd.DataFrame, bench_20: float, bench_60: float, market_bias: float) -> Dict:
+def compute_symbol_features(df_symbol: pd.DataFrame, bench20: float = 0.0, bench60: float = 0.0, market_bias: float = 0.0, bench_20: float | None = None, bench_60: float | None = None) -> Dict:
     s = df_symbol.sort_values("date").copy()
     if len(s) < 80:
         return {}
@@ -130,8 +130,12 @@ def compute_symbol_features(df_symbol: pd.DataFrame, bench_20: float, bench_60: 
         return c / prev - 1
 
     ret5 = ret(5); ret20 = ret(20); ret60 = ret(60)
-    rs20 = safe_float(ret20) - safe_float(bench_20, 0)
-    rs60 = safe_float(ret60) - safe_float(bench_60, 0)
+    if bench_20 is not None:
+        bench20 = bench_20
+    if bench_60 is not None:
+        bench60 = bench_60
+    rs20 = safe_float(ret20) - safe_float(bench20, 0)
+    rs60 = safe_float(ret60) - safe_float(bench60, 0)
 
     trend_ok = (c > ema20) + (ema20 > ema50) + (ema50 > ema200)
     trend_score = trend_ok / 3.0
