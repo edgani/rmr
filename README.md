@@ -1,41 +1,47 @@
-# IDX .JK brute-force finder
+# IDX Front-Run Scanner — From Scratch Pack
 
-Ini workaround kalau roster resmi IDX susah diambil otomatis.
+Ini paket paling lengkap yang sudah digabung jadi satu repo bersih dari nol.
 
-## Apa yang script ini lakukan
-- generate semua kombinasi simbol 4 huruf `AAAA.JK` s/d `ZZZZ.JK`
-- kirim ke endpoint quote Yahoo secara batch
-- simpan yang dibalas valid ke CSV
+## Isi utama
+- `streamlit_app.py` — app utama Streamlit
+- `src/` — logic scanner, broker, intraday, macro filter, ranking, explainability
+- `data/` — starter universe + template CSV
+- `scripts/` — builder/merge universe + audit helper
 
-## Kapan dipakai
-- kalau lo mau net tambahan dari Yahoo sendiri
-- **bukan** pengganti roster resmi IDX
-
-## Kenapa 4 huruf
-Mayoritas kode emiten biasa IDX pakai 4 huruf.
-
-## Jalankan
+## Run cepat
 ```bash
-pip install requests
-python discover_jk_universe_bruteforce.py --output data/idx_universe_bruteforce.csv --resume
+pip install -r requirements.txt
+streamlit run streamlit_app.py
 ```
 
-## Test cepat dulu
+## Yang penting buat full universe
+App akan paling stabil kalau baca universe lokal dari:
+- `data/idx_universe_full.csv`
+
+Kalau file itu belum lengkap, pakai builder:
 ```bash
-python discover_jk_universe_bruteforce.py --output data/idx_universe_bruteforce.csv --resume --max-batches 50
+python scripts/build_idx_universe_all.py --output data/idx_universe_full.csv
 ```
 
-## Full run
+Atau strict builder:
 ```bash
-python discover_jk_universe_bruteforce.py --output data/idx_universe_bruteforce.csv --resume --batch-size 100 --sleep 0.25
+python scripts/build_idx_universe_wiki_strict.py --output data/idx_universe_full.csv
 ```
 
-## Output
-- `data/idx_universe_bruteforce.csv`
-- `data/idx_universe_bruteforce.audit.json`
+## Audit universe
+```bash
+python scripts/export_universe_audit_demo.py
+```
 
-## Catatan penting
-- ini bisa lama
-- ini bisa miss ticker yang Yahoo nggak balas dengan clean
-- ini bisa include simbol yang valid di Yahoo tapi bukan target universe final lo
-- tetap paling bagus merge hasil ini dengan roster resmi / file master lokal
+## Data optional yang bisa di-upload di app
+- broker summary CSV
+- broker master CSV
+- done detail CSV
+- orderbook CSV
+- route/catalyst events CSV
+
+## Status jujur
+- Ini paket paling lengkap untuk base deploy-safe + front-run aware scanner.
+- Harga pakai yfinance `.JK`.
+- Universe starter yang ikut di dalam belum otomatis 100% full IDX kecuali lu build/replace `data/idx_universe_full.csv`.
+- Broker/intraday makin kuat kalau lu upload data real.

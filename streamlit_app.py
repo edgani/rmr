@@ -28,14 +28,21 @@ st.set_page_config(page_title="IDX Scanner V5.0", layout="wide")
 BASE_DIR = Path(__file__).resolve().parent
 
 BUCKET_ORDER = [
-    "OPPORTUNITY SEKARANG",
-    "FRONT-RUN MARKET",
+    "SIAP NAIK SEKARANG",
+    "HAMPIR SIAP — TUNGGU TRIGGER",
+    "SUDAH NAIK — TUNGGU PULLBACK / SIGNAL BERIKUTNYA",
+    "WATCH REBOUND",
+    "JANGAN SENTUH DULU",
+    "AVOID / BUANG",
 ]
 BUCKET_HELP = {
-    "OPPORTUNITY SEKARANG": "Nama buy-side yang paling siap dieksekusi sekarang. Entry masih masuk akal.",
-    "FRONT-RUN MARKET": "Nama yang belum paling obvious, tapi mulai align. Fokus radar sebelum crowd masuk.",
+    "SIAP NAIK SEKARANG": "Setup sudah paling rapi. Fokus kandidat entry terdekat.",
+    "HAMPIR SIAP — TUNGGU TRIGGER": "Belum masuk sekarang. Tunggu trigger yang jelas.",
+    "SUDAH NAIK — TUNGGU PULLBACK / SIGNAL BERIKUTNYA": "Arah masih oke, tapi entry sekarang rawan telat.",
+    "WATCH REBOUND": "Pantulan taktis, bukan trend sehat utama.",
+    "JANGAN SENTUH DULU": "Belum ada edge jelas. Simpan di radar saja.",
+    "AVOID / BUANG": "Risiko distribusi / breakdown lebih dominan.",
 }
-HIDDEN_BUCKET = "BUKAN FOKUS BUY SEKARANG"
 
 
 def load_csv(upload, kind: str) -> pd.DataFrame:
@@ -162,111 +169,45 @@ def classify_bucket(row: pd.Series, micro_available: bool) -> tuple[str, str]:
     bull_trap = num(row.get("bull_trap_score"), 50)
     bear_trap = num(row.get("bear_trap_score"), 50)
     absorb_up = num(row.get("absorption_after_up_score"), 50)
-    macro_state = txt(row.get("macro_filter_state"), "CAUTION").upper()
 
-    if verdict in {"AVOID", "TRIM", "ILLIQUID"}:
-        return HIDDEN_BUCKET, "Belum layak jadi ide buy"
-    if macro_state == "OFFSIDE":
-        return HIDDEN_BUCKET, "Lawan route / macro utama"
-    if risk_rank >= 78 or wet - dry >= 22:
-        return HIDDEN_BUCKET, "Risk terlalu besar untuk fokus buy"
-    if micro_available and burst_bias == "BEARISH" and bear_trap < 50 and verdict != "WATCH_REBOUND":
-        return HIDDEN_BUCKET, "Tekanan jual masih dominan"
-
-    ready_now = False
-    if verdict == "READY_LONG" and false_break < 45 and risk_rank < 65 and conf >= 50:
-        if micro_available:
-            ready_now = burst_bias == "BULLISH" and bull_trap < 55 and absorb_up < 55
-        else:
-            ready_now = breakout >= 55 or long_rank >= 65 or route_fit >= 58
-    elif verdict == "NEUTRAL" and trend >= 65 and breakout >= 60 and dry >= wet and long_rank >= 68 and conf >= 55:
-        ready_now = True
-
-    if ready_now:
-        if rs20 > 0.10 and (risk_rank >= 58 or false_break >= 42):
-            return "FRONT-RUN MARKET", "Sudah kuat, tapi tunggu pullback / signal ulang"
-        return "OPPORTUNITY SEKARANG", "Sudah align dan entry masih masuk akal"
-
-    if verdict in {"WATCH", "WATCH_REBOUND"} and (breakout >= 40 or route_fit >= 50 or long_rank >= 52):
-        base_reason = "Belum aktif penuh, tapi trigger mulai dekat"
-    elif verdict == "READY_LONG":
-        base_reason = "Sudah bagus, tapi lebih enak tunggu pullback / trigger ulang"
-    elif verdict == "NEUTRAL" and trend >= 55 and dry >= wet and (route_fit >= 45 or rs20 > 0.03 or long_rank >= 52):
-        base_reason = "Struktur mulai rapi, masih tahap persiapan"
-    else:
-        return HIDDEN_BUCKET, "Belum cukup dekat ke setup buy"
-
-    if conf < 35:
-        return HIDDEN_BUCKET, "Confidence masih terlalu rendah"
-    return "FRONT-RUN MARKET", base_reason
+    if verdict in {"AVOID", "TRIM"} or risk_rank >= 75 or wet - dry >= 20:
+        return "AVOID / BUANG", "Struktur/risiko masih jelek"
+    if verdict == "WATCH_REBOUND":
+        return "WATCH REBOUND", "Pantulan ada, tapi belum trend sehat utama"
+    if verdict == "READY_LONG":
+        if (rs20 > 0.08 and risk_rank >= 55) or false_break >= 45:
+            return "SUDAH NAIK — TUNGGU PULLBACK / SIGNAL BERIKUTNYA", "Arah masih oke tapi entry sekarang rawan telat"
+        if micro_available and burst_bias == "BULLISH" and bull_trap < 50 and absorb_up < 50:
+            return "SIAP NAIK SEKARANG", "Trigger + microstructure mendukung"
+        return "SIAP NAIK SEKARANG", "Setup sudah paling rapi sekarang"
+    if verdict == "WATCH":
+        if breakout >= 45 or route_fit >= 55 or long_rank >= 55:
+            return "HAMPIR SIAP — TUNGGU TRIGGER", "Setup bagus tapi trigger belum lengkap"
+        return "JANGAN SENTUH DULU", "Masih watchlist, belum ada edge kuat"
+    if verdict == "NEUTRAL":
+        if trend >= 60 and dry >= wet and (rs20 > 0.06 or long_rank >= 60):
+            return "SUDAH NAIK — TUNGGU PULLBACK / SIGNAL BERIKUTNYA", "Arah cukup sehat tapi tunggu entry lebih rapi"
+        if breakout >= 40 or route_fit >= 50:
+            return "HAMPIR SIAP — TUNGGU TRIGGER", "Sudah mendekat ke trigger"
+        return "JANGAN SENTUH DULU", "Belum ada alasan kuat buat masuk"
+    if verdict == "ILLIQUID":
+        return "AVOID / BUANG", "Likuiditas terlalu tipis"
+    if micro_available and burst_bias == "BEARISH" and bear_trap < 50:
+        return "AVOID / BUANG", "Tekanan jual masih dominan"
+    if conf < 45:
+        return "JANGAN SENTUH DULU", "Confidence terlalu rendah"
+    return "JANGAN SENTUH DULU", "Belum cukup jelas"
 
 
 def timing_text(bucket: str) -> str:
     return {
-        "OPPORTUNITY SEKARANG": "Boleh cicil / entry sekarang",
-        "FRONT-RUN MARKET": "Masuk radar, tunggu trigger paling enak",
-        HIDDEN_BUCKET: "Belum fokus buy",
+        "SIAP NAIK SEKARANG": "Boleh cicil / entry sekarang",
+        "HAMPIR SIAP — TUNGGU TRIGGER": "Tunggu break / reclaim",
+        "SUDAH NAIK — TUNGGU PULLBACK / SIGNAL BERIKUTNYA": "Tunggu pullback / retest",
+        "WATCH REBOUND": "Taktikal saja, jangan agresif",
+        "JANGAN SENTUH DULU": "Simpan di radar",
+        "AVOID / BUANG": "Hindari dulu",
     }.get(bucket, "-")
-
-
-def front_run_lane(row: pd.Series, bucket: str) -> str:
-    breakout = num(row.get("breakout_integrity"))
-    route_fit = num(row.get("route_fit_score"), num(row.get("route_rank_score")))
-    conf = num(row.get("score_confidence"))
-    false_break = num(row.get("false_breakout_risk"))
-    dry = num(row.get("dry_score_final"), num(row.get("dry_score")))
-    wet = num(row.get("wet_score_final"), num(row.get("wet_score")))
-    rs20 = num(row.get("relative_strength_20d"))
-    if bucket == "OPPORTUNITY SEKARANG":
-        if breakout >= 68 and false_break <= 35 and conf >= 65:
-            return "PALING DEKAT ENTRY"
-        if dry >= wet and rs20 > 0.05:
-            return "STRUKTUR PALING BERSIH"
-        return "MASIH LAYAK BUY"
-    if bucket == "FRONT-RUN MARKET":
-        if route_fit >= 70 and breakout < 60:
-            return "PALING EARLY"
-        if breakout >= 45 and conf >= 50:
-            return "HAMPIR TRIGGER"
-        return "NEXT WAVE"
-    return "-"
-
-
-def build_board_reason(row: pd.Series) -> str:
-    pieces = []
-    trend = num(row.get("trend_quality"))
-    breakout = num(row.get("breakout_integrity"))
-    dry = num(row.get("dry_score_final"), num(row.get("dry_score")))
-    wet = num(row.get("wet_score_final"), num(row.get("wet_score")))
-    route = txt(row.get("route_primary"), "-")
-    macro_state = txt(row.get("macro_filter_state"), "-")
-    if trend >= 65:
-        pieces.append("trend sehat")
-    elif trend >= 50:
-        pieces.append("trend mulai rapi")
-    if breakout >= 65:
-        pieces.append("trigger dekat")
-    elif breakout >= 45:
-        pieces.append("breakout hampir matang")
-    if dry > wet + 8:
-        pieces.append("barang ringan")
-    elif wet > dry + 8:
-        pieces.append("barang masih berat")
-    if macro_state in {"ALIGNED", "NEXT_ROUTE"}:
-        pieces.append(f"align {route.lower()}")
-    return ", ".join(pieces[:3]) if pieces else txt(row.get("alasan_singkat"), "-")
-
-
-def build_header_summary(simple_df: pd.DataFrame, audit: dict | None) -> dict:
-    if simple_df.empty:
-        return {}
-    route = txt(simple_df.get("route_primary", pd.Series(dtype=object)).mode().iloc[0] if "route_primary" in simple_df.columns and not simple_df["route_primary"].dropna().empty else "-")
-    catalyst = txt(simple_df.get("top_catalyst_title", pd.Series(dtype=object)).dropna().iloc[0] if "top_catalyst_title" in simple_df.columns and simple_df["top_catalyst_title"].notna().any() else "-")
-    macro_state = txt(simple_df.get("macro_filter_state", pd.Series(dtype=object)).mode().iloc[0] if "macro_filter_state" in simple_df.columns and not simple_df["macro_filter_state"].dropna().empty else "-")
-    opp = int((simple_df["status_awam"] == "OPPORTUNITY SEKARANG").sum())
-    fr = int((simple_df["status_awam"] == "FRONT-RUN MARKET").sum())
-    micro_live = bool((audit or {}).get("done_rows", 0) > 0 or (audit or {}).get("orderbook_rows", 0) > 0)
-    return {"route": route, "catalyst": catalyst, "macro_state": macro_state, "opp": opp, "front": fr, "micro_live": micro_live}
 
 
 def build_simple_table(scan_df: pd.DataFrame, audit: dict | None, macro_hard_filter: bool = True, macro_strictness: str = "balanced") -> pd.DataFrame:
@@ -279,11 +220,12 @@ def build_simple_table(scan_df: pd.DataFrame, audit: dict | None, macro_hard_fil
     statuses = out.apply(lambda r: classify_bucket(r, micro_available), axis=1)
     base_bucket = [s[0] for s in statuses]
     base_reason = [s[1] for s in statuses]
-    out["status_awam"] = base_bucket
-    if macro_hard_filter and "macro_note" in out.columns:
-        macro_notes = out.get("macro_note", pd.Series(index=out.index, dtype=object)).fillna("").astype(str)
-        out["alasan_singkat"] = [f"{reason} | {note}" if note and bucket != HIDDEN_BUCKET else reason for reason, note, bucket in zip(base_reason, macro_notes, base_bucket)]
+    if macro_hard_filter:
+        adjusted = [apply_macro_bucket_override(r, b, strictness=macro_strictness) for (_, r), b in zip(out.iterrows(), base_bucket)]
+        out["status_awam"] = [x[0] for x in adjusted]
+        out["alasan_singkat"] = [f"{reason} | {extra}" if extra else reason for reason, (_, extra) in zip(base_reason, adjusted)]
     else:
+        out["status_awam"] = base_bucket
         out["alasan_singkat"] = base_reason
     out["timing"] = out["status_awam"].map(timing_text)
     out["bid_offer_state"] = out.apply(lambda r: micro_label(r, micro_available), axis=1)
@@ -291,8 +233,6 @@ def build_simple_table(scan_df: pd.DataFrame, audit: dict | None, macro_hard_fil
     out["trigger_singkat"] = out.get("trigger", "-").astype(str).str.slice(0, 120)
     out["invalidator_singkat"] = out.get("invalidator", "-").astype(str).str.slice(0, 120)
     out["why_now_short"] = out.get("why_now", "-").astype(str).str.slice(0, 120)
-    out["board_lane"] = out.apply(lambda r: front_run_lane(r, txt(r.get("status_awam"))), axis=1)
-    out["board_reason"] = out.apply(build_board_reason, axis=1)
     out["entry_score"] = (
         pd.to_numeric(out.get("long_rank_score", 0), errors="coerce").fillna(0.0) * 0.45
         + pd.to_numeric(out.get("route_rank_score", 0), errors="coerce").fillna(0.0) * 0.25
@@ -301,19 +241,14 @@ def build_simple_table(scan_df: pd.DataFrame, audit: dict | None, macro_hard_fil
     ).round(2)
     if macro_hard_filter and "entry_score_macro" in out.columns:
         out["entry_score"] = pd.to_numeric(out["entry_score_macro"], errors="coerce").fillna(out["entry_score"])
-    out["action_priority"] = out["entry_score"]
-    out.loc[out["board_lane"].eq("PALING DEKAT ENTRY"), "action_priority"] += 8
-    out.loc[out["board_lane"].eq("PALING EARLY"), "action_priority"] += 6
-    out.loc[out["board_lane"].eq("HAMPIR TRIGGER"), "action_priority"] += 4
     order = {name: i for i, name in enumerate(BUCKET_ORDER)}
-    order[HIDDEN_BUCKET] = 999
     out["bucket_order"] = out["status_awam"].map(order).fillna(999)
-    out = out.sort_values(["bucket_order", "action_priority", "score_confidence"], ascending=[True, False, False]).reset_index(drop=True)
+    out = out.sort_values(["bucket_order", "entry_score", "score_confidence"], ascending=[True, False, False]).reset_index(drop=True)
     return out
 
 
-st.title("IDX Scanner V5.4 — Buy-Side Front-Run Board Max")
-st.caption("Versi buy-side buat IHSG: fokus cuma 2 papan — opportunity sekarang dan front-run market. Nama yang belum layak buy dipindah ke advanced/debug.")
+st.title("IDX Scanner V5.0 — Action View")
+st.caption("Versi yang lebih gampang dibaca: fokus ke action bucket, trigger, invalidator, dan timing. Kolom debug dipindah ke advanced view.")
 last_run = read_last_run(BASE_DIR)
 if last_run:
     st.caption(f"Last persisted run UTC: {last_run}")
@@ -467,13 +402,15 @@ if run_validation:
 
 if audit is not None:
     micro_live = audit.get("done_rows", 0) > 0 or audit.get("orderbook_rows", 0) > 0
-    cols = st.columns(6)
+    cols = st.columns(8)
     cols[0].metric("Tickers scanned", audit.get("ticker_count_loaded", 0))
-    cols[1].metric("Opportunity sekarang", int((simple_df["status_awam"] == "OPPORTUNITY SEKARANG").sum()) if isinstance(simple_df, pd.DataFrame) and not simple_df.empty else 0)
-    cols[2].metric("Front-run market", int((simple_df["status_awam"] == "FRONT-RUN MARKET").sum()) if isinstance(simple_df, pd.DataFrame) and not simple_df.empty else 0)
-    cols[3].metric("Bukan fokus buy", int((simple_df["status_awam"] == HIDDEN_BUCKET).sum()) if isinstance(simple_df, pd.DataFrame) and not simple_df.empty else 0)
-    cols[4].metric("Source mode", audit.get("source_mode", "n/a"))
-    cols[5].metric("Bid-offer", "AKTIF" if micro_live else "BELUM AKTIF")
+    cols[1].metric("Ready sekarang", int((simple_df["status_awam"] == "SIAP NAIK SEKARANG").sum()) if isinstance(simple_df, pd.DataFrame) and not simple_df.empty else 0)
+    cols[2].metric("Hampir siap", int((simple_df["status_awam"] == "HAMPIR SIAP — TUNGGU TRIGGER").sum()) if isinstance(simple_df, pd.DataFrame) and not simple_df.empty else 0)
+    cols[3].metric("Tunggu pullback", int((simple_df["status_awam"] == "SUDAH NAIK — TUNGGU PULLBACK / SIGNAL BERIKUTNYA").sum()) if isinstance(simple_df, pd.DataFrame) and not simple_df.empty else 0)
+    cols[4].metric("Watch rebound", int((simple_df["status_awam"] == "WATCH REBOUND").sum()) if isinstance(simple_df, pd.DataFrame) and not simple_df.empty else 0)
+    cols[5].metric("Avoid / buang", int((simple_df["status_awam"] == "AVOID / BUANG").sum()) if isinstance(simple_df, pd.DataFrame) and not simple_df.empty else 0)
+    cols[6].metric("Source mode", audit.get("source_mode", "n/a"))
+    cols[7].metric("Bid-offer", "AKTIF" if micro_live else "BELUM AKTIF")
     if isinstance(simple_df, pd.DataFrame) and not simple_df.empty and "route_summary" in simple_df.columns:
         top_route = str(simple_df["route_summary"].mode().iloc[0])
         st.caption("Macro route aktif: %s | Hard filter: %s (%s)" % (top_route, "ON" if macro_hard_filter else "OFF", macro_strictness))
@@ -489,7 +426,7 @@ if audit is not None:
 view = st.radio("View", ["Action View", "Ticker Detail", "Advanced Table", "Validation", "Data Audit"], horizontal=True)
 
 if view == "Action View":
-    st.subheader("Buy-Side Board — fokus buy")
+    st.subheader("Action View — gampang dibaca")
     if simple_df.empty:
         st.info("Belum ada hasil scan. Klik Run scanner.")
     else:
@@ -498,33 +435,11 @@ if view == "Action View":
         if use_bid_offer and audit and (audit.get("done_rows", 0) > 0 or audit.get("orderbook_rows", 0) > 0):
             work = work.sort_values(["status_awam", "bid_offer_state", "entry_score", "score_confidence"], ascending=[True, True, False, False])
         macro_focus = st.selectbox("Fokus macro state", options=["Semua", "ALIGNED", "NEXT_ROUTE", "CAUTION", "OFFSIDE"], index=0)
-        top_bucket = st.selectbox("Fokus papan", options=["Semua"] + BUCKET_ORDER, index=0)
-        show_hidden = st.checkbox("Tampilkan juga yang bukan fokus buy", value=False)
+        top_bucket = st.selectbox("Fokus bucket", options=["Semua"] + BUCKET_ORDER, index=0)
         if macro_focus != "Semua" and "macro_filter_state" in work.columns:
             work = work[work["macro_filter_state"] == macro_focus].copy()
-        if not show_hidden:
-            work = work[work["status_awam"].isin(BUCKET_ORDER)].copy()
         if top_bucket != "Semua":
             work = work[work["status_awam"] == top_bucket].copy()
-        hidden_count = int((simple_df["status_awam"] == HIDDEN_BUCKET).sum()) if isinstance(simple_df, pd.DataFrame) and not simple_df.empty else 0
-        if hidden_count and not show_hidden:
-            st.caption(f"{hidden_count} nama lain disembunyikan dari papan utama karena belum fokus buy sekarang.")
-        st.markdown("#### Top picks ringkas")
-        top_now = work[work["status_awam"].eq("OPPORTUNITY SEKARANG")].head(5)
-        top_front = work[work["status_awam"].eq("FRONT-RUN MARKET")].head(5)
-        a,b = st.columns(2)
-        with a:
-            st.markdown("**Opportunity sekarang — top 5**")
-            if top_now.empty:
-                st.caption("Belum ada nama yang cukup bersih.")
-            else:
-                st.dataframe(top_now[[c for c in ["ticker","board_lane","board_reason","trigger_singkat","confidence_text"] if c in top_now.columns]].rename(columns={"ticker":"Ticker","board_lane":"Status","board_reason":"Alasan","trigger_singkat":"Trigger","confidence_text":"Confidence"}), use_container_width=True, hide_index=True)
-        with b:
-            st.markdown("**Front-run market — top 5**")
-            if top_front.empty:
-                st.caption("Belum ada radar front-run yang menarik.")
-            else:
-                st.dataframe(top_front[[c for c in ["ticker","board_lane","board_reason","trigger_singkat","confidence_text"] if c in top_front.columns]].rename(columns={"ticker":"Ticker","board_lane":"Status","board_reason":"Alasan","trigger_singkat":"Trigger","confidence_text":"Confidence"}), use_container_width=True, hide_index=True)
         for bucket in BUCKET_ORDER:
             bucket_df = work[work["status_awam"] == bucket].copy()
             if bucket_df.empty:
@@ -532,7 +447,7 @@ if view == "Action View":
             st.markdown(f"### {bucket}")
             st.caption(BUCKET_HELP[bucket])
             cols = [
-                "ticker", "sector", "close", "board_lane", "bid_offer_state", "board_reason", "trigger_singkat",
+                "ticker", "sector", "close", "status_awam", "bid_offer_state", "alasan_singkat", "trigger_singkat",
                 "invalidator_singkat", "timing", "confidence_text", "route_primary", "top_catalyst_title", "macro_filter_state"
             ]
             cols = [c for c in cols if c in bucket_df.columns]
@@ -540,9 +455,9 @@ if view == "Action View":
                 "ticker": "Ticker",
                 "sector": "Sector",
                 "close": "Close",
-                "board_lane": "Status",
+                "status_awam": "Status",
                 "bid_offer_state": "Bid-Offer / Micro",
-                "board_reason": "Alasan Singkat",
+                "alasan_singkat": "Alasan Singkat",
                 "trigger_singkat": "Trigger",
                 "invalidator_singkat": "Invalidation",
                 "timing": "Timing",
@@ -555,7 +470,7 @@ if view == "Action View":
             st.dataframe(show_df, use_container_width=True, hide_index=True)
         with st.expander("Lihat advanced table"):
             adv_cols = [c for c in [
-                "ticker","board_lane","action_priority","verdict","score_confidence","phase","trend_quality","breakout_integrity","false_breakout_risk",
+                "ticker","verdict","score_confidence","phase","trend_quality","breakout_integrity","false_breakout_risk",
                 "dry_score_final","wet_score_final","broker_alignment_score","broker_mode","dominant_accumulator",
                 "dominant_distributor","institutional_support","institutional_resistance","latest_event_label",
                 "long_rank_score","risk_rank_score","route_rank_score","why_now","why_not_yet"
@@ -574,14 +489,14 @@ elif view == "Ticker Detail":
         ticker = selected.split(" — ")[0]
         row = simple_df.loc[simple_df["ticker"] == ticker].iloc[0]
         c1, c2, c3, c4, c5, c6 = st.columns(6)
-        c1.metric("Status", row.get("board_lane", row["status_awam"]))
+        c1.metric("Status", row["status_awam"])
         c2.metric("Timing", row.get("timing", "-"))
         c3.metric("Confidence", row.get("confidence_text", "-"))
         c4.metric("Bid-Offer / Micro", row.get("bid_offer_state", "-"))
         c5.metric("Route", row.get("route_primary", "-"))
         c6.metric("Catalyst", txt(row.get("top_catalyst_title"), "-"))
         render_candles(price_df, ticker)
-        st.markdown(f"**Alasan singkat:** {row.get('board_reason', row.get('alasan_singkat', '-'))}")
+        st.markdown(f"**Alasan singkat:** {row.get('alasan_singkat', '-')}")
         st.markdown(f"**Why now:** {row.get('why_now', '-')}")
         st.markdown(f"**Why not yet:** {row.get('why_not_yet', '-')}")
         st.markdown(f"**Trigger:** {row.get('trigger', '-')}")
