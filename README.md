@@ -1,35 +1,53 @@
-# IDX EOD Smoke Test (Clean GitHub Deploy)
+# IDX EOD Scanner V3
 
-This repo is intentionally minimal so it can be deployed from zero without Streamlit multipage issues.
+Single-file Streamlit app untuk:
+- EOD IDX via `yfinance` ticker `.JK`
+- Optional broker summary CSV import
+- Optional done detail CSV import
+- Optional orderbook CSV import
+- Burst / gulungan up-down, bullish/bearish burst, trap risk, dan watch rebound
 
-## What this app does
-- Fetches EOD prices for IDX tickers using `yfinance` with the `.JK` suffix
-- Builds a simple smoke-test watchlist
-- Shows a candlestick chart and basic scores
-- Exports raw prices and the latest watchlist to CSV
+## Run
 
-## Important
-- The Streamlit app entrypoint is **`streamlit_app.py`**
-- Do **not** create a `pages/` folder in this repo
-- This is a **price-side EOD smoke test**, not a full broker-summary / bid-offer / done-detail engine yet
-
-## Local run
 ```bash
 pip install -r requirements.txt
 streamlit run streamlit_app.py
 ```
 
-## Streamlit Community Cloud
-- Deploy this repo from a **fresh GitHub repo**
-- Set the **App file** to:
+## CSV templates
 
-```text
-streamlit_app.py
-```
+Lihat folder `data/`:
+- `idx_universe_sample.csv`
+- `broker_summary_template.csv`
+- `done_detail_template.csv`
+- `orderbook_template.csv`
 
-## If you still see `_navigation(...)`
-That means Streamlit is still treating your deploy as a multipage app.
-Check that the deployed repo does not contain a `pages/` directory.
+## Minimal schema
 
-## Default ticker universe
-BBCA, BBRI, BMRI, BBNI, TLKM, ASII, ICBP, INDF, ANTM, MDKA, UNTR, AMRT, PANI, BRIS, GOTO, ADRO
+### broker summary
+- `date`
+- `ticker`
+- `broker_code`
+- `buy_lot`
+- `sell_lot`
+- optional: `buy_value`, `sell_value`
+
+### done detail
+- `timestamp`
+- `ticker`
+- `price`
+- `lot`
+- `side` (`B` / `S`)
+- optional: `buyer_broker`, `seller_broker`
+
+### orderbook
+- `timestamp`
+- `ticker`
+- `bid_1_price`, `bid_1_lot`, `bid_2_price`, `bid_2_lot`, `bid_3_price`, `bid_3_lot`
+- `offer_1_price`, `offer_1_lot`, `offer_2_price`, `offer_2_lot`, `offer_3_price`, `offer_3_lot`
+
+## Catatan jujur
+
+- EOD tetap bergantung pada `yfinance`.
+- Broker / done detail / orderbook layer masih bergantung pada file yang lu upload.
+- Ini belum full production Hengky-style engine, tapi sudah naik dari EOD price-side ke broker + intraday burst layer.
