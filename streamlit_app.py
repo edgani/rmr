@@ -18,6 +18,7 @@ from src.data_audit import audit_broker_summary, audit_done_detail, audit_orderb
 from src.fetch_prices import fetch_yf_prices_batched, retry_failed_tickers
 from src.scoring import compute_ticker_features
 from src.universe import resolve_universe_source
+from src.route_overlay import derive_route_state, build_route_overlay
 
 st.set_page_config(page_title="IDX Scanner V4.2 Maxed", layout="wide")
 BASE_DIR = Path(__file__).resolve().parent
@@ -79,8 +80,8 @@ def render_candles(price_df: pd.DataFrame, ticker: str):
     st.plotly_chart(fig, use_container_width=True)
 
 
-st.title("IDX Scanner V4.5 — Intraday Hardening Max")
-st.caption("Full-universe resolver + disk cache + retry + broker/intraday hooks + sector-aware RS + explainability + ranking.")
+st.title("IDX Scanner V4.7 — Full Merge Final")
+st.caption("Full-universe resolver + disk cache + retry + broker/intraday hardening + route-aware next-play overlay + explainability + ranking.")
 last_run = read_last_run(BASE_DIR)
 if last_run:
     st.caption(f"Last persisted run UTC: {last_run}")
@@ -108,6 +109,7 @@ with st.sidebar:
     broker_master_upload = st.file_uploader("Broker master CSV (optional)", type=["csv"], key="broker_master")
     done_upload = st.file_uploader("Done detail CSV", type=["csv"], key="done")
     orderbook_upload = st.file_uploader("Orderbook CSV", type=["csv"], key="orderbook")
+    route_events_upload = st.file_uploader("Route / catalyst events CSV (optional)", type=["csv"], key="route_events")
 
     run_scan = st.button("Run scanner", type="primary")
 
@@ -116,6 +118,7 @@ broker_df = load_csv(broker_upload, "broker")
 broker_master_df = load_csv(broker_master_upload, "broker_master")
 done_df = load_csv(done_upload, "done_detail")
 book_df = load_csv(orderbook_upload, "orderbook")
+route_events_df = load_csv(route_events_upload, "route_events")
 
 if run_scan:
     with st.spinner("Resolving universe..."):
@@ -152,6 +155,29 @@ if run_scan:
             price_df = merge_cached_and_new_prices(cached_prices, fetch_result.prices) if use_cached_prices else fetch_result.prices.copy()
 
     scan_df = compute_ticker_features(price_df, broker_df=broker_df, done_df=done_df, orderbook_df=book_df, metadata_df=universe_df, broker_master_df=broker_master_df)
+    if not scan_df.empty:
+        bias_series = pd.to_numeric(scan_df.get("market_bias_score", pd.Series(dtype=float)), errors="coerce") if "market_bias_score" in scan_df.columns else pd.Series(dtype=float)
+        market_bias = float(bias_series.median()) if not bias_series.empty else 50.0
+        regime = str(scan_df["market_regime"].mode().iloc[0]) if "market_regime" in scan_df.columns and not scan_df["market_regime"].dropna().empty else "CHOPPY"
+        exec_mode = str(scan_df["execution_mode"].mode().iloc[0]) if "execution_mode" in scan_df.columns and not scan_df["execution_mode"].dropna().empty else "SELECTIVE"
+        mh_count = int((scan_df.get("burst_bias", pd.Series(dtype=object)).astype(str).eq("BULLISH")).sum()) if "burst_bias" in scan_df.columns else 0
+        catalyst_score = 0.0
+        analog_label = "unknown"
+        scenario_family = "unknown"
+        if not route_events_df.empty:
+            if "catalyst_score" in route_events_df.columns:
+                catalyst_score = float(pd.to_numeric(route_events_df["catalyst_score"], errors="coerce").fillna(0).max())
+            if "analog_label" in route_events_df.columns and route_events_df["analog_label"].notna().any():
+                analog_label = str(route_events_df["analog_label"].dropna().iloc[0])
+            if "scenario_family" in route_events_df.columns and route_events_df["scenario_family"].notna().any():
+                scenario_family = str(route_events_df["scenario_family"].dropna().iloc[0])
+        route_state = derive_route_state(market_regime=regime, execution_mode=exec_mode, market_bias_score=market_bias, most_hated_clear_count=mh_count, catalyst_window_score=catalyst_score, analog_label=analog_label, scenario_family=scenario_family)
+        scan_df = build_route_overlay(scan_df, route_state, route_events_df if not route_events_df.empty else None)
+        if "route_fit_score" in scan_df.columns:
+            rel = pd.to_numeric(scan_df.get("relative_strength_20d", 0), errors="coerce").fillna(0.0)
+            conf = pd.to_numeric(scan_df.get("score_confidence", 0), errors="coerce").fillna(0.0)
+            catalyst = pd.to_numeric(scan_df.get("catalyst_window_score", 0), errors="coerce").fillna(0.0) * 100.0
+            scan_df["route_rank_score"] = (scan_df["route_fit_score"].fillna(0.0) * 55.0 + conf * 0.25 + catalyst * 0.10 + rel.clip(-0.10, 0.10) * 100.0).round(2)
     audit = merge_audits(
         audit_prices(price_df, attempted_tickers=len(fetch_result.attempted_tickers), failed_tickers=fetch_result.failed_tickers, batch_reports=fetch_result.batch_reports),
         audit_broker_summary(broker_df),
@@ -190,6 +216,8 @@ if audit is not None:
         st.warning(audit["stale_warning"])
     for w in audit.get("universe_warnings", []) or []:
         st.warning(w)
+    if audit.get("universe_source") == "fallback_sample":
+        st.error("Universe masih fallback sample. Itu sebabnya ticker sedikit. Tambah data/idx_universe_full.csv atau biarkan app cache universe besar lebih dulu.")
     if audit.get("failed_ticker_count", 0) > 0:
         with st.expander("Failed ticker report"):
             st.write(audit.get("failed_tickers_preview", ""))
@@ -218,7 +246,7 @@ if view == "Scanner":
             "trend_quality","breakout_integrity","false_breakout_risk","dry_score_final","wet_score_final","drywet_state",
             "broker_alignment_score","broker_persistence_score","broker_mode","dominant_accumulator","dominant_distributor","institutional_support","institutional_resistance","institutional_support_low","institutional_support_high","institutional_resistance_low","institutional_resistance_high","float_lock_score","supply_overhang_score",
             "gulungan_up_score","gulungan_down_score","latest_event_label","relative_strength_20d","sector_relative_strength_20d",
-            "long_rank_score","risk_rank_score","why_now","why_not_yet","trigger","invalidator","dominant_risk"
+            "long_rank_score","risk_rank_score","route_rank_score","route_primary","route_bias","forward_radar_bucket","top_catalyst_title","why_now","why_not_yet","trigger","invalidator","dominant_risk"
         ]
         cols = [c for c in cols if c in tmp.columns]
         st.dataframe(tmp[cols], use_container_width=True, hide_index=True)
@@ -233,12 +261,12 @@ elif view == "Top Ranks":
         c1, c2 = st.columns(2)
         with c1:
             st.markdown("### Top Long Candidates")
-            long_cols = [c for c in ["ticker","sector","verdict","long_rank_score","score_confidence","phase","relative_strength_20d","sector_relative_strength_20d","why_now","trigger","invalidator"] if c in scan_df.columns]
+            long_cols = [c for c in ["ticker","sector","verdict","long_rank_score","route_rank_score","score_confidence","phase","route_primary","forward_radar_bucket","relative_strength_20d","sector_relative_strength_20d","why_now","trigger","invalidator"] if c in scan_df.columns]
             long_df = scan_df[scan_df["verdict"].isin(["READY_LONG","WATCH","WATCH_REBOUND","NEUTRAL"])].sort_values(["long_rank_score","score_confidence"], ascending=False).head(n)
             st.dataframe(long_df[long_cols], use_container_width=True, hide_index=True)
         with c2:
             st.markdown("### Top Risk / Avoid / Trim")
-            risk_cols = [c for c in ["ticker","sector","verdict","risk_rank_score","score_confidence","phase","dominant_risk","why_not_yet","invalidator"] if c in scan_df.columns]
+            risk_cols = [c for c in ["ticker","sector","verdict","risk_rank_score","score_confidence","phase","route_bias","dominant_risk","why_not_yet","invalidator"] if c in scan_df.columns]
             risk_df = scan_df.sort_values(["risk_rank_score","score_confidence"], ascending=False).head(n)
             st.dataframe(risk_df[risk_cols], use_container_width=True, hide_index=True)
 
@@ -256,6 +284,8 @@ elif view == "Ticker Detail":
         c4.metric("Burst", row.get("latest_event_label", "-"))
         c5.metric("Market", row.get("market_regime", "-"))
         c6.metric("Sector", row.get("sector", "-"))
+        if "route_primary" in row.index:
+            st.caption(f"Route: {row.get('route_primary','-')} | Bias: {row.get('route_bias','-')} | Radar: {row.get('forward_radar_bucket','-')}")
         render_candles(price_df, ticker)
         detail_cols = [
             "trend_quality","breakout_integrity","false_breakout_risk","dry_score_final","wet_score_final",

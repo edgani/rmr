@@ -145,9 +145,9 @@ def build_route_overlay(scan_df: pd.DataFrame,
     for _, row in df.iterrows():
         verdict = str(row.get("verdict", "")).upper()
         sector = str(row.get("sector", "Unknown"))
-        dry = _safe(row.get("dry_score"), 0.5)
-        risk = _safe(row.get("distribution_risk_score"), 0.5)
-        breakout = _safe(row.get("breakout_integrity_score"), 0.5)
+        dry = _safe(row.get("dry_score_final", row.get("dry_score", 0.0)), 0.0) / 100.0
+        risk = _safe(row.get("risk_rank_score", row.get("false_breakout_risk", 50.0)), 50.0) / 100.0
+        breakout = _safe(row.get("breakout_integrity", row.get("breakout_integrity_score", 50.0)), 50.0) / 100.0
         rel = _safe(row.get("relative_strength_20d"), 0.0)
         score = 0.5
         if route_state.bias in {"LONG_BIAS", "TACTICAL_RISK_ON"}:

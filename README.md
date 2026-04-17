@@ -1,32 +1,24 @@
-# IDX EOD Scanner V4.6 — Route-Aware Ranking + Validation Patch
+# IDX Scanner V4.5 — Intraday Hardening Max
 
-This patch adds the two missing higher-value blocks:
-1. route-aware next-play ranking
-2. walk-forward / false-signal validation helpers
+Deploy-safe single-file Streamlit scanner for IDX using free yfinance `.JK` EOD plus optional broker summary, done detail, and orderbook uploads.
 
-What this is:
-- a patch pack you can drop into the current clean scanner repo
-- Python modules for route overlay, ranking, and validation
-- designed to be import-safe and deploy-safe
+## Added in V4.5
+- stronger done detail normalization and aggressor inference
+- same-second split-order clustering
+- bidirectional burst engine with follow-through and trap scoring
+- orderbook refill / fake wall / absorption proxies
+- stronger confidence penalties when intraday context is missing
+- scanner verdicts now react to trap vs continuation, not just burst direction
 
-What this is not:
-- a claim of live alpha
-- a substitute for real broker / done detail / orderbook data
-- a finished production validation report
+## Run
+```bash
+pip install -r requirements.txt
+streamlit run streamlit_app.py
+```
 
-## Files
-- `src/route_overlay.py`
-- `src/ranking.py`
-- `src/validation.py`
-- `tests/test_route_validation.py`
-- `data/example_route_events.csv`
 
-## Integration target
-Import these modules into the current scanner app and call:
-- `build_route_overlay(...)`
-- `build_rank_scores(...)`
-- `run_walk_forward_validation(...)`
-
-## Notes
-- Thresholds are rule-based and should be recalibrated on real data.
-- Walk-forward is scaffolded for honest evaluation, not curve-fit optimization.
+## V4.7 fixes
+- safer rank-score handling when broker columns are missing
+- cached full universe fallback at `data/cache/latest_universe.csv`
+- optional `Route / catalyst events CSV` upload for next-play overlay
+- hard warning when the app falls back to the 19-name sample universe

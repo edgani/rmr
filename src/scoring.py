@@ -17,6 +17,19 @@ def _clip01(x):
     return float(np.clip(x, 0.0, 1.0))
 
 
+
+
+def _series_from_get(out: pd.DataFrame, key: str, default=0.0) -> pd.Series:
+    val = out.get(key, None)
+    if isinstance(val, pd.Series):
+        return pd.to_numeric(val, errors="coerce")
+    if val is None:
+        return pd.Series(default, index=out.index, dtype=float)
+    try:
+        return pd.Series([val] * len(out), index=out.index, dtype=float)
+    except Exception:
+        return pd.Series(default, index=out.index, dtype=float)
+
 def _to_num(df: pd.DataFrame, cols: list[str]) -> pd.DataFrame:
     for c in cols:
         if c in df.columns:
@@ -154,25 +167,25 @@ def _add_metadata_and_sector_features(out: pd.DataFrame, metadata_df: pd.DataFra
 
 
 def _compute_rank_scores(out: pd.DataFrame) -> pd.DataFrame:
-    rs20 = pd.to_numeric(out.get("relative_strength_20d", 0), errors="coerce").fillna(0.0)
-    sec_rs = pd.to_numeric(out.get("sector_relative_strength_20d", 0), errors="coerce").fillna(0.0)
-    broker = pd.to_numeric(out.get("broker_alignment_score", 0), errors="coerce").fillna(0.0)
-    persistence = pd.to_numeric(out.get("broker_persistence_score", 0), errors="coerce").fillna(0.0)
-    overhang = pd.to_numeric(out.get("overhang_score", 0), errors="coerce").fillna(0.0)
-    dry = pd.to_numeric(out.get("dry_score_final", out.get("dry_score", 0)), errors="coerce").fillna(0.0)
-    bi = pd.to_numeric(out.get("breakout_integrity", 0), errors="coerce").fillna(0.0)
-    tq = pd.to_numeric(out.get("trend_quality", 0), errors="coerce").fillna(0.0)
-    fb = pd.to_numeric(out.get("false_breakout_risk", 50), errors="coerce").fillna(50.0)
-    conf = pd.to_numeric(out.get("score_confidence", 0), errors="coerce").fillna(0.0)
-    market_bias = pd.to_numeric(out.get("market_bias_score", 50), errors="coerce").fillna(50.0)
-    burst_up = pd.to_numeric(out.get("gulungan_up_score", 0), errors="coerce").fillna(0.0)
-    burst_dn = pd.to_numeric(out.get("gulungan_down_score", 0), errors="coerce").fillna(0.0)
-    absorb_up = pd.to_numeric(out.get("absorption_after_up_score", 0), errors="coerce").fillna(0.0)
-    absorb_dn = pd.to_numeric(out.get("absorption_after_down_score", 0), errors="coerce").fillna(0.0)
-    fu = pd.to_numeric(out.get("post_up_followthrough_score", 0), errors="coerce").fillna(0.0)
-    fd = pd.to_numeric(out.get("post_down_followthrough_score", 0), errors="coerce").fillna(0.0)
-    btrap = pd.to_numeric(out.get("bull_trap_score", 0), errors="coerce").fillna(0.0)
-    beartrap = pd.to_numeric(out.get("bear_trap_score", 0), errors="coerce").fillna(0.0)
+    rs20 = _series_from_get(out, "relative_strength_20d", 0.0).fillna(0.0)
+    sec_rs = _series_from_get(out, "sector_relative_strength_20d", 0.0).fillna(0.0)
+    broker = _series_from_get(out, "broker_alignment_score", 0.0).fillna(0.0)
+    persistence = _series_from_get(out, "broker_persistence_score", 0.0).fillna(0.0)
+    overhang = _series_from_get(out, "overhang_score", 0.0).fillna(0.0)
+    dry = _series_from_get(out, "dry_score_final", float("nan")).fillna(_series_from_get(out, "dry_score", 0.0)).fillna(0.0)
+    bi = _series_from_get(out, "breakout_integrity", 0.0).fillna(0.0)
+    tq = _series_from_get(out, "trend_quality", 0.0).fillna(0.0)
+    fb = _series_from_get(out, "false_breakout_risk", 50.0).fillna(50.0)
+    conf = _series_from_get(out, "score_confidence", 0.0).fillna(0.0)
+    market_bias = _series_from_get(out, "market_bias_score", 50.0).fillna(50.0)
+    burst_up = _series_from_get(out, "gulungan_up_score", 0.0).fillna(0.0)
+    burst_dn = _series_from_get(out, "gulungan_down_score", 0.0).fillna(0.0)
+    absorb_up = _series_from_get(out, "absorption_after_up_score", 0.0).fillna(0.0)
+    absorb_dn = _series_from_get(out, "absorption_after_down_score", 0.0).fillna(0.0)
+    fu = _series_from_get(out, "post_up_followthrough_score", 0.0).fillna(0.0)
+    fd = _series_from_get(out, "post_down_followthrough_score", 0.0).fillna(0.0)
+    btrap = _series_from_get(out, "bull_trap_score", 0.0).fillna(0.0)
+    beartrap = _series_from_get(out, "bear_trap_score", 0.0).fillna(0.0)
 
     out["long_rank_score"] = (
         0.18 * tq
@@ -192,7 +205,7 @@ def _compute_rank_scores(out: pd.DataFrame) -> pd.DataFrame:
         - 0.04 * overhang
     ).round(2)
     out["risk_rank_score"] = (
-        0.18 * pd.to_numeric(out.get("wet_score_final", out.get("wet_score", 0)), errors="coerce").fillna(0.0)
+        0.18 * _series_from_get(out, "wet_score_final", float("nan")).fillna(_series_from_get(out, "wet_score", 0.0)).fillna(0.0)
         + 0.14 * fb
         + 0.12 * overhang
         + 0.08 * burst_dn
