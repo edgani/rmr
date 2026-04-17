@@ -1,32 +1,37 @@
-# IDX Scanner V4.5 — Intraday Hardening Max
+# IDX Universe Builder Pack
 
-Deploy-safe single-file Streamlit scanner for IDX using free yfinance `.JK` EOD plus optional broker summary, done detail, and orderbook uploads.
+This pack helps you create a **local master universe** for the scanner so the app does not depend on unstable web fallbacks.
 
-## Added in V4.5
-- stronger done detail normalization and aggressor inference
-- same-second split-order clustering
-- bidirectional burst engine with follow-through and trap scoring
-- orderbook refill / fake wall / absorption proxies
-- stronger confidence penalties when intraday context is missing
-- scanner verdicts now react to trap vs continuation, not just burst direction
+## Build a full baseline universe from Wikipedia
 
-## Run
 ```bash
-pip install -r requirements.txt
-streamlit run streamlit_app.py
+pip install pandas requests lxml html5lib
+python scripts/build_idx_universe_from_wiki.py --output data/idx_universe_full.csv
 ```
 
+This will build a local CSV with columns:
+- `ticker`
+- `symbol_yf`
+- `company_name`
+- `listing_date`
+- `shares_outstanding`
+- `board`
+- `sector`
+- `status`
 
-## V4.7 fixes
-- safer rank-score handling when broker columns are missing
-- cached full universe fallback at `data/cache/latest_universe.csv`
-- optional `Route / catalyst events CSV` upload for next-play overlay
-- hard warning when the app falls back to the 19-name sample universe
+## Merge with your own additions / corrections
 
+```bash
+python scripts/merge_universe_csvs.py data/idx_universe_full.csv my_extra_tickers.csv --output data/idx_universe_full.csv
+```
 
-## Input normalizer hardening
-This build adds aggressive CSV normalization for universe/metadata, broker summary, broker master, done detail, orderbook, and route/catalyst events. Common alias columns, mixed casing, noisy currency text, and decimal comma formats are normalized automatically before scoring.
+## Recommended workflow
 
+1. Build the baseline universe.
+2. Open the scanner app.
+3. Make the app read `data/idx_universe_full.csv` as the source of truth.
+4. Periodically rebuild / merge updates.
 
-## V5.0 Action View
-Default view sekarang dibikin lebih gampang dibaca untuk orang awam: 6 bucket action, trigger, invalidation, timing, dan confidence.
+## Note
+
+This is a practical way to get a much more complete universe than the small fallback sample. It is still best to replace this with a direct official export when you have one.
