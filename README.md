@@ -1,34 +1,41 @@
-# IDX Universe All-Ticker Builder
+# IDX .JK brute-force finder
 
-Tujuan pack ini: bantu bikin `data/idx_universe_full.csv` yang jauh lebih lengkap daripada seed 300-an/374.
+Ini workaround kalau roster resmi IDX susah diambil otomatis.
 
-Builder akan coba:
-1. halaman resmi IDX `Daftar Saham` / `Stock List` / `Profil Perusahaan Tercatat`
-2. fallback publik dari Wikipedia / mirror publik
+## Apa yang script ini lakukan
+- generate semua kombinasi simbol 4 huruf `AAAA.JK` s/d `ZZZZ.JK`
+- kirim ke endpoint quote Yahoo secara batch
+- simpan yang dibalas valid ke CSV
 
-## Run
+## Kapan dipakai
+- kalau lo mau net tambahan dari Yahoo sendiri
+- **bukan** pengganti roster resmi IDX
+
+## Kenapa 4 huruf
+Mayoritas kode emiten biasa IDX pakai 4 huruf.
+
+## Jalankan
 ```bash
-pip install pandas requests lxml html5lib
-python scripts/build_idx_universe_all.py --output data/idx_universe_full.csv
+pip install requests
+python discover_jk_universe_bruteforce.py --output data/idx_universe_bruteforce.csv --resume
 ```
 
-## Merge file tambahan sendiri
+## Test cepat dulu
 ```bash
-python scripts/merge_universe_csvs.py data/idx_universe_full.csv my_extra.csv --output data/idx_universe_full.csv
+python discover_jk_universe_bruteforce.py --output data/idx_universe_bruteforce.csv --resume --max-batches 50
 ```
 
-## Output columns
-- ticker
-- symbol_yf
-- company_name
-- listing_date
-- shares_outstanding
-- board
-- sector
-- status
-- source_url
+## Full run
+```bash
+python discover_jk_universe_bruteforce.py --output data/idx_universe_bruteforce.csv --resume --batch-size 100 --sleep 0.25
+```
 
-## Catatan
-- builder ini ditujukan buat jalan di environment yang punya internet.
-- hasilnya tetap harus diaudit, karena sumber publik bisa berubah format.
-- kalau lu punya export resmi IDX stock list, merge saja ke file hasil builder ini dan jadikan itu source of truth app.
+## Output
+- `data/idx_universe_bruteforce.csv`
+- `data/idx_universe_bruteforce.audit.json`
+
+## Catatan penting
+- ini bisa lama
+- ini bisa miss ticker yang Yahoo nggak balas dengan clean
+- ini bisa include simbol yang valid di Yahoo tapi bukan target universe final lo
+- tetap paling bagus merge hasil ini dengan roster resmi / file master lokal
